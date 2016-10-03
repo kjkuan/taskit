@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+#
+# TasKit - A Task Automation Framework in Bash
+#
+# TODOs:
+#   - add execution statistics
+#   - make log line configurable
+#   - correctly order tasks in the order they are defined, even for sourced tasks.
+#   - detect circular task dependency
+#   - allow task aliases. e.g., @aliases
+#   - allow tagging tasks for search, and filtered execution
+#   - tests
+#   - allow pre/post task hooks
+#   - think about task namespace support.
+#
+#   - allow remote task execution. e.g., with @remote 
+#
+#
+set -E
+
+# Start time of the first task
+TASKIT_START_TIME=
+
+TASKIT_SOURCE_PATH=$0
+
+TASKIT_STACKTRACE_FILE=/tmp/taskit-errtrace.$$
+: > "$TASKIT_STACKTRACE_FILE"
+
+taskit_show_stack_trace () {
+    echo "--- TasKit task stack trace from shell process $BASHPID -------------"
+    echo ${BASH_LINENO[0]} ${FUNCNAME[1]} "${BASH_SOURCE[1]}"
+    local i=1
+    while caller $((i++)); do :; done
+}
+# Only track stack traces during set -e.
+# We'll print the stack trace from the nearest subshell in the EXIT trap
+# defined later.
+trap 'if [[ $- == *e* ]]; then taskit_show_stack_trace >>"$TASKIT_STACKTRACE_FILE"; fi' ERR
+
+# Error messages from taskit; most recent error last
+TASKIT_ERRORS=()
+
+# Users can add commands to be called in the EXIT trap to this array
+TASKIT_EXIT_CMDS=(taskit_cleanup)
+
+taskit_cleanup () {
+    local rc=$?
+
+    if [[ ${TASKIT_START_TIME:-} ]]; then
+        local now; printf -v now "%(%s)T"
+        taskit_log "Duration: $(date -u -d @$(( now - TASKIT_START_TIME )) +%T)"
+    fi
+
+    # combine and show errors from TasKit if there's any.
+    if (( ${#TASKIT_ERRORS[*]} )); then
+        local oIFS=$IFS; IFS=$'\n'
+        echo "${TASKIT_ERRORS[*]}" >&2
+        IFS=$oIFS
+    fi
+
+    # if we are exiting because of last task returning a non-zero exit code
+    # then show the task name, line number and the returning line in the task.
+    if [[ $rc != 0 ]]; then
+        if [[ ${TASKIT_RETLINE:-} ]]; then
+            local task=${TASKIT_RETLINE%% *}
+            local lineno=${TASKIT_RETLINE#"$task "}; lineno=${lineno%% *}
+            echo
+            echo "$task returned $rc at line $lineno: $(
+                echo "${TASKIT_RETLINE}" | cut -d' ' -f3-
+            )"
+        fi
+    fi
+
+    # show the most recent stack trace if any.
+    # (not showing traces from TasKit, unless -v debug is on)
+    if [[ -r $TASKIT_STACKTRACE_FILE ]]; then
+        local lines=$(
+            awk -v taskit_src="$TASKIT_SOURCE_PATH" \
+                -v level=$TASKIT_LOG_LEVEL '
+                NR==1, NR!=1 && $1 ~ /^---/ {
+                    if (level >= 0 && $3 == taskit_src) next
+                    if (NR==1 || $0 !~ /^---/) print
+                }
+            ' < "$TASKIT_STACKTRACE_FILE"
+        )
+        if [[ $(echo "$lines" | wc -l) -gt 1 ]]; then
+            echo; echo "$lines"
+        fi
+        rm -f "$TASKIT_STACKTRACE_FILE"
+    fi
+} >&2
+
+# set up the EXIT trap to call taskit_cleanup first so that we get error
+# reporting as early as possilbe. Later EXIT trap will be updated to run
+# whatever's in TASKIT_EXIT_CMDS.
+#
+trap taskit_cleanup EXIT
+
+
+# To make TasKit pretty
+ESC=$'\e'
+C_RED="$ESC[31m"
+C_GREEN="$ESC[32m"
+C_CYAN="$ESC[36m"
+C_YELLOW="$ESC[33m"
+C_OFF="$ESC[39m"
+
+declare -Ag TASKIT_LOG_LEVELS=(
+    [DEBUG]=-1
+    [INFO]=0
+    [WARNING]=1
+    [ERROR]=2
+    [FATAL]=3
+    [SILENCE]=4
+)
+# Current log level, it can be set via -v
+TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[INFO]}
+
+# Path to Taskfile, either set via -f or ./Taskfile will be used
+TASKIT_TASKFILE=
+
+# Any lines printed by TasKit during task execution will be prefixed
+# by the value of this variable if set(in your Taskfile or as an environment
+# variable). Defaults to a 8-character random string.
+TASKIT_LINE_PREFIX=${TASKIT_LINE_PREFIX:-"$(openssl rand -hex 4)"}
+
+# These are used to track cli options
+TASKIT_SHOW_HELP=
+TASKIT_SHOW_TASKS=
+TASKIT_SKIP_DEPS=
+
+# Temporary scrap var used internally, don't look.
+TASKIT__=
+
+# A task is a function whose name is prefixed with 'Task::'.
+# This array holds all task function names in definition order.
+TASKS=()
+
+# 
+# Holds attributes for every task
+#
+declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
+#
+# A task attribute setter is a function whose name is prefixed with '@'.
+#
+# All task attributes should be specified within single-line null
+# commands(:) that are specified immediately after an opening task function
+# definition.
+#
+# Each task attribute function has access to a dynamically scoped
+# $TASK variable, which is the name of the task function within which
+# the attribute is specified.
+#
+
+# Sets a short description for the task
+@desc () { TASK_ATTRS[$TASK$FUNCNAME]=$*; }
+
+# Task parameter specification
+#
+# A task function can declare named parameters using the @param task attribute.
+# The format is: @param <spec> [description]
+# where <spec> is the parameter name with a one character suffix denoting how
+# the parameter will be collected:
+#
+#   name        - parameter is optional
+#   name=value  - parameter is optional with default value(can be omitted)
+#   name!       - parameter is required
+#   name%  - any unknown named arguments will be collected into an associative
+#            array.
+#
+@param () {  # <spec> [description]
+    local spec=$1; shift
+
+    local has_default
+    if [[ $spec == *=* ]]; then
+        local value=${spec#*=}; has_default=1
+        spec=${spec%%=*}=
+    fi
+    [[ $spec =~ [_a-zA-Z][_a-zA-Z0-9]*[!%=]? ]] || {
+        TASKIT_ERRORS+=("Invalid parameter specification for $TASK: $1")
+        return 1
+    }
+    local name=${spec%[\!%=]}
+    [[ ! ${TASK_ATTRS[$TASK$FUNCNAME $name]:-} ]] || {
+        TASKIT_ERRORS+=("Duplicate parameter spec in $TASK: $name")
+        return 1
+    }
+    if [[ $spec == *% && "${TASK_ATTRS[$TASK$FUNCNAME]} " == *%* ]]; then
+        TASKIT_ERRORS+=("Multiple % parameters is not allowed!")
+        return 1
+    fi
+    TASK_ATTRS[$TASK$FUNCNAME]+=" $spec"
+    TASK_ATTRS[$TASK$FUNCNAME $name]=$*
+    if [[ ${has_default:-} ]]; then
+        TASK_ATTRS[$TASK$FUNCNAME $name default]=$value
+    fi
+}
+
+# By default, taskit stops at the first task that exited with a non-zero exit
+# status. Set this to true tells taskit to continue with the next task regardless of
+# the task's exit status.
+@ignore_status () {
+    local val; taskit_parse_bool "${1:-yes}" val || return $?
+    TASK_ATTRS[$TASK$FUNCNAME]=$val
+}
+
+# A list of tasks that this task depends on. These tasks will be started in the
+# ordered listed and taskit will wait for all depended tasks to return before
+# starting this task.
+#
+@needs () { # <task1> [name=value ...] [task2 ...]
+    (( $# )) || return 1
+
+    # here we save the dependency specification first and process them all
+    # later. This allows us to have multiple @needs declarations for a task.
+    #
+    local name=task_needs_$RANDOM
+    declare -ag $name
+    local -n items=$name; items=("$@")
+
+    TASK_ATTRS[$TASK$FUNCNAME]+=" $name"
+}
+_taskit_process_task@needs () {
+    local task=$1 name needs=()
+    for name in ${TASK_ATTRS[$task@needs]}; do
+        local -n items=$name 
+        needs+=("${items[@]}")
+        unset items
+    done
+
+    local tasks=()
+    taskit_parse_args_of_tasks "${needs[@]}" || return $?
+    # above adds "task_func_name task_args_array_name" to the tasks array.
+
+    TASK_ATTRS[$task@needs]=${tasks[*]}
+}
+
+# These are task attributes set by taskit for internal use.
+#
+# @noargs_status - exit status of the no argument run of the task.
+# @status - a string of exit codes from each run of the task.
+# -----------------------------------------------------------------------------
+
+taskit_parse_bool () {
+    local -n result_=${2:?required}
+    case ${1,,} in
+        y|yes|t|true|1) result_=1  ;;
+        n|no|f|false|0) result_=   ;;
+        *)              return 1   ;;
+    esac
+}
+
+
+taskit_init () {
+    TASKS=($(
+        tasks=$(declare -F | cut -d' ' -f3- | grep ^Task::) &&
+        shopt -s extdebug &&
+        declare -F $tasks | sort -nk2 | cut -d' ' -f1
+    ))
+
+    # Parse the function definition for each task in order to evaluate
+    # task attribute specifications.
+    #
+    # We are not 100% strict but the parsing should work most cases.
+    #
+    local funcname line TASK
+    for funcname in ${TASKS[*]}; do
+        while read -r line; do
+            if [[ $line =~ ^Task:: ]]; then
+                TASK=${line%% *}; read       # read off the '{'
+
+                # we don't allow '=' in task function name as it can confused
+                # with named arguments passed to a task
+                if [[ $TASK == *=* ]]; then
+                    TASKIT_ERRORS+=("Invalid task name: $TASK")
+                    return 1
+                fi
+
+                # enable RETURN trap in order to save the line
+                # number from which the last failed task returned.
+                declare -ft $TASK
+
+            elif [[ $line =~ ^[[:space:]]*(\( )?:[[:space:]]+@ ]]; then
+                # NOTE: \( is for functions whose body is a subshell
+                deco=@${line#*@}
+                eval "$deco" || return $?
+            else
+                break
+            fi
+        done < <(declare -f $funcname)
+    done
+
+    taskit_post_init || return $?
+
+    # The following trap is written in a single line in this source file to avoid
+    # adding line counts to $LINENO.
+    trap 'TASKIT__=$BASH_COMMAND; if [[ $FUNCNAME == Task::* ]]; then TASKIT_RETLINE="$FUNCNAME $LINENO $TASKIT__"; fi' RETURN
+}
+
+taskit_post_init () {
+    local task
+    for task in ${TASKS[*]}; do
+        _taskit_process_task@needs $task || {
+            TASKIT_ERRORS+=("Failed processing dependencies for $task")
+            return 1
+        }
+    done
+}
+
+taskit_show_tasks () {
+    printf "Available tasks:\n\n"
+    local task description
+    for task in ${TASKS[*]}; do
+        description=${TASK_ATTRS[$task@desc]}
+        [[ $description ]] || continue
+        printf "  %s %b - %b %s\n" ${task#Task::} '\t' '\t' "$description"
+    done | column -ts$'\t'
+    echo
+}
+
+taskit_show_task_help () {
+    local task=Task::${1#Task::}
+    local lineno_file
+    lineno_file=$(
+        shopt -s extdebug; set -o pipefail
+        declare -F $task | cut -d' ' -f2-
+    ) || {
+        TASKIT_ERRORS+=("Unknown task: $1")
+        exit 1
+    }
+
+    local C_ON=$C_CYAN indent="        "
+    echo "${C_ON:-}TASK${C_ON:+$C_OFF}"
+    echo "$indent${C_ON:-}${task#Task::}${C_ON:+$C_OFF} -- ${TASK_ATTRS[$task@desc]%.}."
+
+    # print consecutive comment lines before the task definition as the
+    # detailed task description.
+    #
+    echo
+    echo "${C_ON:-}DESCRIPTION${C_ON:+$C_OFF}"
+    awk -v lineno=${lineno_file%% *} '
+            /^ *#/     { lines[i++]=$0; next }
+            NR==lineno { for (i in lines) print lines[i]; exit 0 }
+                       { delete lines }
+    ' < "${lineno_file#* }" | sed -r "s/^[# ]+/$indent/" | fmt -s
+
+    local spec param param_desc
+    local specs=${TASK_ATTRS[$task@param]}
+    if [[ $specs ]]; then
+        echo
+        echo "${C_ON:-}PARAMETERS${C_ON:+$C_OFF}"
+    fi
+    for spec in $specs; do
+        param=${spec%[\!%=]}
+
+        # if param has a default value
+        if [[ "$specs " =~ \ $param=\  ]]; then
+            spec=${spec}${TASK_ATTRS[$task@param $param default]}
+        fi
+
+        param_desc=${TASK_ATTRS[$task@param $param]}
+        param_desc=${param_desc^}
+        echo "$indent${C_ON:-}$spec${C_ON:+$C_OFF} -- ${param_desc%.}."
+    done | column -ts-
+}
+
+taskit_parse_args_of_tasks() {
+    local task arg errors=()
+    while (( $# )); do
+        task=Task::${1#Task::}; shift
+
+        if ! declare -F $task >/dev/null; then
+            errors+=("Task function not found: $task")
+            shift; continue
+        fi
+
+        # collect arguments for the current task
+        local args=()
+        for arg in "$@"; do
+            case $arg in
+              *=*) args+=("$arg"); shift ;;
+                *) break ;;
+            esac
+        done
+
+        # dynamically allocate an associative array for storing the arguments
+        local task_args=task_args_$RANDOM; declare -gA $task_args
+        tasks+=("$task $task_args")
+
+        local -n task_args=$task_args
+        local specs=${TASK_ATTRS[$task@param]:-}
+        local unknown=()
+
+        # save the task arguments according to the parameter specs
+        local name
+        for arg in "${args[@]}"; do
+            name=${arg%%=*}
+            [[ ${name:-} ]] || {
+                errors+=("Missing parameter name for $task: $arg")
+                continue
+            }
+            [[ $name =~  [_a-zA-Z][_a-zA-Z0-9]* ]] || {
+                errors+=("Invalid argument name for $task: $arg")
+                continue
+            }
+            if [[ "$specs " =~ \ $name[!=]?\  ]]; then
+                task_args[$name]=${arg#*=}
+            else
+                unknown+=("$arg")
+            fi
+        done
+
+
+        # loop through the parameter specs to check that the task arguments
+        # collected met the specs.
+        #
+        local spec param value
+        for spec in $specs; do
+            param=${spec%[\!%=]}; sigil=${spec#$param}
+
+            if [[ $sigil = % ]]; then
+                declare -Ag "${task_args[$param]:=${param}_$RANDOM}"
+                local i=0
+                for arg in "${unknown[@]}"; do
+                    name=${arg%%=*} value=${arg#*=}
+                    printf -v "${task_args[$param]}[$name]" "%s" "$value"
+                    unset 'unknown[i++]'
+                done
+
+            else 
+                if [[ " ${!task_args[*]} " != *\ $param\ * ]]; then
+                    if [[ $sigil = '=' ]]; then
+                        task_args[$param]=${TASK_ATTRS[$task@param $param default]}
+
+                    elif [[ $sigil = \! ]]; then
+                        errors+=("Required parameter not set for $task: $param")
+                    fi
+                fi
+            fi
+        done
+        if (( ${#unknown[*]} )); then
+            errors+=("Unknown arguments for $task: ${unknown[*]}")
+        fi
+    done
+
+    if [[ ${errors:-} ]]; then
+        local oIFS=$IFS; IFS=$'\n'
+        TASKIT_ERRORS+=("${errors[*]}")
+        IFS=$oIFS
+
+        __taskit_free_args_of_tasks
+        return 1
+    fi
+}
+
+__taskit_free_args_of_tasks () {
+    local t task
+    for t in "${tasks[@]}"; do
+        task=${t%% *}; local -n args_dict=${t#* }
+
+        local spec param sigil
+        for spec in ${TASK_ATTRS[$task@param]}; do
+            param=${spec%[\!%=]}; sigil=${spec#$param}
+            if [[ $sigil = '%' ]]; then
+                unset "args_dict[$param]"
+            fi
+        done
+        unset args_dict
+    done
+}
+
+
+__taskit_break_if_not_ignoring_failed () {
+    # require $task and $rc in the caller...
+
+    if [[ $rc != 0 ]]; then
+        if [[ ! ${TASK_ATTRS[$task@ignore_status]:-} ]]; then
+            break
+        fi
+    fi
+}
+
+taskit_log () {  # [level] <message>
+    local level=${TASKIT_LOG_LEVELS[$1]:-} label
+    if [[ ${level:-} ]]; then
+        label=$1; shift
+    else
+        level=${TASKIT_LOG_LEVELS[INFO]}
+        label=INFO
+    fi
+    (( level >= TASKIT_LOG_LEVEL )) || return 0
+
+    local logf fd
+    case $label in
+      INFO) logf=/dev/stdout; fd=1 ;;
+         *) logf=/dev/stderr; fd=2 ;;
+    esac
+
+    local color
+    if [[ -t $fd ]]; then
+        case $label in
+          DEBUG) color=$C_CYAN ;; 
+          INFO) color=$C_GREEN ;;
+          WARNING) color=$C_YELLOW ;; 
+          ERROR|FATAL) color=$C_RED ;;
+        esac
+    fi
+
+    local ts; printf -v ts "%(%Y-%m-%dT%T%z)T"
+    printf "${color:-}$TASKIT_LINE_PREFIX %s|%s|user=%s|pid=$$|$label|%s${color:+"$C_OFF"}\n" \
+           "$HOSTNAME" \
+           "$ts" \
+           "$USER" \
+           "$*" \
+      >$logf
+}
+
+taskit_run () { # [task1 [name1=value1 ...] task2 ...]
+    local tasks=()
+    taskit_parse_args_of_tasks "$@" || return $?
+
+    local t rc task
+    for t in "${tasks[@]}"; do
+        task=${t%% *}
+        _taskit_run_task_with_args $task ${t#* }; rc=$?
+        __taskit_break_if_not_ignoring_failed
+        TASKIT_RETLINE=
+    done
+    return $rc
+}
+declare -ft taskit_run  # to support the RETURN trap.
+
+_taskit_run_task_with_args () {
+    local task rc
+
+    if [[ ! ${TASKIT_SKIP_DEPS:-} ]]; then
+        local i=0 deps=(${TASK_ATTRS[$1@needs]})
+        while (( ${#deps[*]} )); do
+            task=${deps[i]}
+            _taskit_run_task_with_args $task ${deps[i+1]}; rc=$?
+            __taskit_break_if_not_ignoring_failed
+            TASKIT_RETLINE=
+            unset 'deps[i]' 'deps[i+1]'; (( i += 2 ))
+        done
+
+        # if we didn't finish running all dependencies
+        if (( ${#deps[*]} )); then return $rc; fi
+    fi
+
+    task=$1
+    local -n args_dict=$2
+
+    if [[ ${#args_dict[*]} = 0 && ${TASK_ATTRS[$task@noargs_status]:-} = 0 ]]; then
+        taskit_log DEBUG "$task (noargs) had been completed successfully, skipping..."
+        return 0
+    fi
+
+    # make the task's arguments available as $_{param} variables in the task
+    # function
+    local spec param sigil
+    for spec in ${TASK_ATTRS[$task@param]}; do
+        param=${spec%[\!%=]}; sigil=${spec#$param}
+        if [[ $sigil = '%' ]]; then
+            local -n "_$param=${args_dict[$param]}"
+        else
+            local "_$param=${args_dict[$param]}"
+        fi
+    done
+
+    # actually run the task and save its exit status
+    taskit_log "$task -- ${TASK_ATTRS[$task@desc]:-}"
+    taskit_log DEBUG "Invoking $task with arguments: "\
+                     "$(IFS=$'\n'; echo $(local -p |grep ^_ | sed 's/^_//'))"
+
+    $task; local rc=$?
+    TASK_ATTRS[$task@status]+=" $rc"
+    if [[ ${#args_dict[*]} = 0 ]]; then
+        TASK_ATTRS[$task@noargs_status]=$rc
+    else
+       : #FIXME: need to check that args with defaults are using the defaults.
+    fi
+
+    # undo the $_{param} variables
+    for spec in ${TASK_ATTRS[$task@param]}; do
+        param=${spec%[\!%=]}; sigil=${spec#$param}
+        unset "_$param"
+        if [[ $sigil = '%' ]]; then
+            unset -n "_$param"
+        fi
+    done
+    unset args_dict
+    unset -n args_dict
+
+    return $rc
+
+}
+declare -ft _taskit_run_task_with_args  # to support the RETURN trap
+
+taskit_show_usage () {
+    echo "Usage: $(basename "$0") [options] [task1 [[arg1]=value1 ...] task2 ...]"
+    echo "\
+options:
+  -h        Show this help.
+  -t        List all available tasks.
+  -D        Skip task dependencies.
+  -v LEVEL  Set the log verbosity level to LEVEL($(IFS=\|
+                echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
+            )).
+  -f FILE   Use FILE as the Taskfile.
+"
+}
+
+taskit_die () { taskit_log FATAL "$@" >&2; exit 1; }
+
+taskit_parse_cli () {
+    local option
+    OPTIND=1
+    while getopts ':htf:Dv:-' option "$@"; do
+        case $option in
+            h) TASKIT_SHOW_HELP=1 ;;
+            t) TASKIT_SHOW_TASKS=1 ;;
+            D) TASKIT_SKIP_DEPS=1
+               taskit_log WARNING "Skipping task dependencies!"
+               ;;
+            v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
+               ;;
+            f) TASKIT_TASKFILE=$OPTARG ;;
+            -) break ;;
+
+            :) taskit_die "Missing option argument for -$OPTARG" ;;
+            \?) taskit_die "Unknown option: -$OPTARG" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    if [[ ${TASKIT_SHOW_HELP:-} && $# -eq 0 ]]; then
+        taskit_show_usage; exit 0
+    fi
+
+    if [[ ! ${TASKIT_TASKFILE:-} ]]; then
+        if [[ -r ./Taskfile ]]; then
+            TASKIT_TASKFILE=./Taskfile
+        else
+            taskit_die "No Taskfile specified via -f" \
+                       "nor one found in the current directory!"
+        fi
+    fi
+    TASKIT__=("$@")
+}
+
+taskit_main () {
+    if (( ${#TASKIT_EXIT_CMDS[*]} )); then
+        local oIFS=$IFS NL=$'\n'; IFS=$NL
+        trap "set +e$NL${TASKIT_EXIT_CMDS[*]}" EXIT
+        IFS=$oIFS
+    fi
+    taskit_init || taskit_die "Failed initializing TasKit!"
+
+    if [[ ${TASKIT_SHOW_HELP:-} ]]; then
+        taskit_show_task_help "$1"; exit 0
+    fi
+
+    if [[ ${TASKIT_SHOW_TASKS:-} ]]; then
+        taskit_show_tasks; exit 0
+    fi
+
+    printf -v TASKIT_START_TIME "%(%s)T"
+
+    # if no tasks specified in the command line
+    if (( ! $# )); then
+
+        # run the default task if one's defined
+        if declare -F Task::default >/dev/null; then
+            taskit_run default
+        else
+            unset TASKIT_START_TIME
+        fi
+    else
+        taskit_run "$@"
+    fi
+}
+
+
+taskit_parse_cli "$@"; set -- "${TASKIT__[@]}"
+
+source "$TASKIT_TASKFILE"
+[[ $? = 0 ]] || taskit_die "Failed sourcing Taskfile! $TASKIT_TASKFILE"
+
+taskit_main "$@"
