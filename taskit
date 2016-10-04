@@ -2,6 +2,29 @@
 #
 # TasKit - A Task Automation Framework in Bash
 #
+# The MIT License (MIT)
+#
+# Copyright (c) 2015 Jack Kuan
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+#
 # TODOs:
 #   - add execution statistics
 #   - make log line configurable
@@ -13,7 +36,7 @@
 #   - allow pre/post task hooks
 #   - think about task namespace support.
 #
-#   - allow remote task execution. e.g., with @remote 
+#   - allow remote task execution. e.g., with @remote
 #
 #
 set -E
@@ -136,7 +159,7 @@ TASKIT__=
 # This array holds all task function names in definition order.
 TASKS=()
 
-# 
+#
 # Holds attributes for every task
 #
 declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
@@ -223,7 +246,7 @@ declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
 _taskit_process_task@needs () {
     local task=$1 name needs=()
     for name in ${TASK_ATTRS[$task@needs]}; do
-        local -n items=$name 
+        local -n items=$name
         needs+=("${items[@]}")
         unset items
     done
@@ -427,7 +450,7 @@ taskit_parse_args_of_tasks() {
                     unset 'unknown[i++]'
                 done
 
-            else 
+            else
                 if [[ " ${!task_args[*]} " != *\ $param\ * ]]; then
                     if [[ $sigil = '=' ]]; then
                         task_args[$param]=${TASK_ATTRS[$task@param $param default]}
@@ -499,9 +522,9 @@ taskit_log () {  # [level] <message>
     local color
     if [[ -t $fd ]]; then
         case $label in
-          DEBUG) color=$C_CYAN ;; 
+          DEBUG) color=$C_CYAN ;;
           INFO) color=$C_GREEN ;;
-          WARNING) color=$C_YELLOW ;; 
+          WARNING) color=$C_YELLOW ;;
           ERROR|FATAL) color=$C_RED ;;
         esac
     fi
