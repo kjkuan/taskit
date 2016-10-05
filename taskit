@@ -595,7 +595,12 @@ _taskit_run_task_with_args () {
     taskit_log DEBUG "Invoking $task with arguments: "\
                      "$(IFS=$'\n'; echo $(local -p |grep ^_ | sed 's/^_//'))"
 
-    $task; local rc=$?
+    if [[ ! ${TASKIT_DRY_RUN:-} ]]; then
+        $task; local rc=$?
+    else
+        rc=0
+    fi
+
     TASK_ATTRS[$task@status]+=" $rc"
     if [[ ${#args_dict[*]} = 0 ]]; then
         TASK_ATTRS[$task@noargs_status]=$rc
@@ -626,6 +631,7 @@ options:
   -h        Show this help.
   -t        List all available tasks.
   -D        Skip task dependencies.
+  -d        Dry run; show but don't really run any tasks.
   -v LEVEL  Set the log verbosity level to LEVEL($(IFS=\|
                 echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
             )).
@@ -638,13 +644,14 @@ taskit_die () { taskit_log FATAL "$@" >&2; exit 1; }
 taskit_parse_cli () {
     local option
     OPTIND=1
-    while getopts ':htf:Dv:-' option "$@"; do
+    while getopts ':htf:Dv:d-' option "$@"; do
         case $option in
             h) TASKIT_SHOW_HELP=1 ;;
             t) TASKIT_SHOW_TASKS=1 ;;
             D) TASKIT_SKIP_DEPS=1
                taskit_log WARNING "Skipping task dependencies!"
                ;;
+            d) TASKIT_DRY_RUN=1 ;;
             v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
                ;;
             f) TASKIT_TASKFILE=$OPTARG ;;
