@@ -336,7 +336,7 @@ taskit_show_tasks () {
     for task in ${TASKS[*]}; do
         description=${TASK_ATTRS[$task@desc]}
         [[ $description ]] || continue
-        printf "  %s %b - %b %s\n" ${task#Task::} '\t' '\t' "$description"
+        printf "  %s \t - \t %s\n" ${task#Task::} "$description"
     done | column -ts$'\t'
     echo
 }
@@ -383,8 +383,8 @@ taskit_show_task_help () {
 
         param_desc=${TASK_ATTRS[$task@param $param]}
         param_desc=${param_desc^}
-        echo "$indent${C_ON:-}$spec${C_ON:+$C_OFF} -- ${param_desc%.}."
-    done | column -ts-
+        echo -e "$indent${C_ON:-}$spec${C_ON:+$C_OFF} \t\t ${param_desc%.}."
+    done | column -ts$'\t'
 }
 
 taskit_parse_args_of_tasks() {
