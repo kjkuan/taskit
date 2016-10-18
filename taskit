@@ -28,7 +28,6 @@
 # TODOs:
 #   - add execution statistics
 #   - make log line configurable
-#   - correctly order tasks in the order they are defined, even for sourced tasks.
 #   - detect circular task dependency
 #   - allow task aliases. e.g., @aliases
 #   - allow tagging tasks for search, and filtered execution
@@ -278,7 +277,15 @@ taskit_init () {
     TASKS=($(
         tasks=$(declare -F | cut -d' ' -f3- | grep ^Task::) &&
         shopt -s extdebug &&
-        declare -F $tasks | sort -nk2 | cut -d' ' -f1
+        declare -F $tasks \
+          |
+        while read -r func lineno file; do
+            file=$(taskit_abspath "$file")
+            declare -n offset=${TASKIT_SRC_MAP[$file]}
+            echo $func $(( lineno + offset )) $file
+        done \
+          |
+        sort -nk2,2 | cut -d' ' -f1
     ))
 
     # Parse the function definition for each task in order to evaluate
@@ -676,6 +683,90 @@ taskit_parse_cli () {
         fi
     fi
     TASKIT__=("$@")
+}
+
+declare -A TASKIT_SRC_MAP  # source_file -> array_name
+#
+# This is a map of source file to array name.
+# source_file is an absolute path. It is the $1 given to the source function.
+#
+# For each file sourced, an entry will be created in the TASKIT_SRC_MAP to keep track
+# of where it is sourced, how many lines it expands to, and what files are
+# sourced directly from it.
+#
+# The source array is of this format: (offset total sourced_file1 sourced_file2 ...)
+#
+#   - offset. Imagin all sourced files are expanded and inserted immediately after
+#     lines that sourced them. This is the line number of a such source command
+#     within the final source that has all sourced files expanded.
+#
+#   - total is the number of lines source_file "expands" to, including all files
+#     that are sourced directly and indirectly from it.
+#
+#   - the rest of elements are absolute pathes sourced directly by source_file.
+
+# Because we have no control over when the source function is called and returns,
+# we need to track the source call stack ourselves. This allows us to update the
+# source array at appropriate time.
+#
+TASKIT_SRC_STACK=()
+
+taskit_abspath() {
+    if [[ $1 != /* ]]; then
+        echo "$(cd "$PWD/${1%/*}" && pwd)/${1##*/}"
+    else
+        echo "$1"
+    fi
+}
+
+
+taskit_srcmap_add_src_node () {
+    local array=source_$RANDOM; declare -ga $array
+    TASKIT_SRC_MAP[$1]=$array
+
+    local offset=$2
+    if (( ${#TASKIT_SRC_STACK[*]} )); then
+        local -n parent=${TASKIT_SRC_STACK[-1]}
+        parent+=("$1")
+        offset=$(( $parent + offset ))
+    fi
+    TASKIT_SRC_STACK+=($array)
+
+    local -n array=$array
+    array+=("$offset" "$(wc -l < "$1")")
+}
+
+taskit_srcmap_update_src_node () {
+    unset 'TASKIT_SRC_STACK[-1]'
+    if (( ${#TASKIT_SRC_STACK[*]} )); then
+        local -n array=${TASKIT_SRC_MAP[$1]}
+        local -n parent=${TASKIT_SRC_STACK[-1]}
+        parent[1]=$(( parent[1] + array[1] ))
+
+        # take all expanded preceeding sibling source calls into account
+        # and update the parent offset.
+        local p
+        for p in "${parent[@]:2}"; do
+            local -n sib=${TASKIT_SRC_MAP[$p]}
+            parent[0]=$(( parent[0] + ${sib[1]} ))
+        done
+    fi
+}
+
+taskit_srcmap_dump () {
+    local k
+    for k in "${!TASKIT_SRC_MAP[@]}"; do
+        local -n array=${TASKIT_SRC_MAP[$k]}
+        echo "$k = ${array[@]}"
+    done
+}
+
+source () {
+    set -- "$(taskit_abspath "$1")" "${@:2}"
+    [[ ${TASKIT_SRC_MAP[$1]:-} ]] && return 0
+    taskit_srcmap_add_src_node "$1" $BASH_LINENO
+    command source "$@"
+    taskit_srcmap_update_src_node "$1"
 }
 
 taskit_main () {
