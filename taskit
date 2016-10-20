@@ -414,10 +414,11 @@ taskit_parse_args_of_tasks() {
         done
 
         # dynamically allocate an associative array for storing the arguments
-        local task_args=task_args_$RANDOM; declare -gA $task_args
-        tasks+=("$task $task_args")
+        local task_args_name=task_args_$RANDOM
+        declare -gA "$task_args_name"
+        tasks+=("$task $task_args_name")
 
-        local -n task_args=$task_args
+        local -n task_args=$task_args_name
         local specs=${TASK_ATTRS[$task@param]:-}
         local unknown=()
 
