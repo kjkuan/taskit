@@ -35,8 +35,7 @@
 #   - allow pre/post task hooks
 #   - think about task namespace support.
 #
-#   - allow remote task execution. e.g., with @remote
-#
+#   - allow remote task execution. e.g., with : @remote
 #
 set -E
 
@@ -45,28 +44,65 @@ TASKIT_START_TIME=
 
 TASKIT_SOURCE_PATH=$0
 
-TASKIT_STACKTRACE_FILE=/tmp/taskit-errtrace.$$
-: > "$TASKIT_STACKTRACE_FILE"
+TASKIT_STACK_TRACE=()
+TASKIT_ST_LEVEL=
+# NOTE: used to ensure "taskit_stack_trace dump" only prints from the most
+#       recent(i.e. top-most) trace when called via the ERR trap.
 
-taskit_show_stack_trace () {
-    echo "--- TasKit task stack trace from shell process $BASHPID -------------"
-    echo ${BASH_LINENO[0]} ${FUNCNAME[1]} "${BASH_SOURCE[1]}"
-    local i=1
-    while caller $((i++)); do :; done
-}
-# Only track stack traces during set -e.
-# We'll print the stack trace from the nearest subshell in the EXIT trap
-# defined later.
-trap 'if [[ $- == *e* ]]; then taskit_show_stack_trace >>"$TASKIT_STACKTRACE_FILE"; fi' ERR
+taskit_stack_trace () {
+    local cmd=$BASH_COMMAND rc=$?
+
+    if [[ $1 = dump ]]; then
+        [[ ! $2 || $2 = 0 ]] || return $rc
+     
+        echo "--- Stack trace from shell process $BASHPID -------------"
+        if [[ $cmd != 'local cmd=$BASH_COMMAND rc=$?' ]]; then
+            echo "Failed command: $cmd"
+            echo "Returned status = $rc"
+            echo
+        fi
+
+        # print manually tracked stack trace.
+        local line
+        for line in "${TASKIT_STACK_TRACE[@]}"; do echo "$line"; done
+        local stlen=${#TASKIT_STACK_TRACE[*]}
+        TASKIT_STACK_TRACE=()
+
+        # print the rest of stack trace using the caller built-in.
+        local trace=$(i=$stlen; while caller $((i++)); do :; done)
+
+        # reformat caller's output to match our own format.
+        oIFS=$IFS; IFS=$'\n'; trace=($trace)
+        local parts=()
+        for line in "${trace[@]}"; do
+            file=${line#* * } lineno=${line%% *}
+            func=${line% "$file"} func=${func#$lineno }
+            echo "File $file, line $lineno, in $func ()"
+        done
+
+    elif [[ $1 = log ]]; then 
+        TASKIT_STACK_TRACE+=("File ${BASH_SOURCE[1]}, line $BASH_LINENO, in ${FUNCNAME[1]} ()")
+    fi
+
+    return $rc
+} >&2
+
+
+trap 'taskit_stack_trace dump $(( TASKIT_ST_LEVEL++ ))' ERR
 
 # Error messages from taskit; most recent error last
 TASKIT_ERRORS=()
 
 # Users can add commands to be called in the EXIT trap to this array
-TASKIT_EXIT_CMDS=(taskit_cleanup)
+TASKIT_EXIT_CMDS=(
+    TASKIT_RC=\$?
+    "set +e"
+    taskit_ssh_clean_up
+    taskit_cleanup
+)
 
 taskit_cleanup () {
-    local rc=$?
+    local rc=${TASKIT_RC:-$?}
 
     if [[ ${TASKIT_START_TIME:-} ]]; then
         local now; printf -v now "%(%s)T"
@@ -76,39 +112,9 @@ taskit_cleanup () {
     # combine and show errors from TasKit if there's any.
     if (( ${#TASKIT_ERRORS[*]} )); then
         local oIFS=$IFS; IFS=$'\n'
+        echo
         echo "${TASKIT_ERRORS[*]}" >&2
         IFS=$oIFS
-    fi
-
-    # if we are exiting because of last task returning a non-zero exit code
-    # then show the task name, line number and the returning line in the task.
-    if [[ $rc != 0 ]]; then
-        if [[ ${TASKIT_RETLINE:-} ]]; then
-            local task=${TASKIT_RETLINE%% *}
-            local lineno=${TASKIT_RETLINE#"$task "}; lineno=${lineno%% *}
-            echo
-            echo "$task returned $rc at line $lineno: $(
-                echo "${TASKIT_RETLINE}" | cut -d' ' -f3-
-            )"
-        fi
-    fi
-
-    # show the most recent stack trace if any.
-    # (not showing traces from TasKit, unless -v debug is on)
-    if [[ -r $TASKIT_STACKTRACE_FILE ]]; then
-        local lines=$(
-            awk -v taskit_src="$TASKIT_SOURCE_PATH" \
-                -v level=$TASKIT_LOG_LEVEL '
-                NR==1, NR!=1 && $1 ~ /^---/ {
-                    if (level >= 0 && $3 == taskit_src) next
-                    if (NR==1 || $0 !~ /^---/) print
-                }
-            ' < "$TASKIT_STACKTRACE_FILE"
-        )
-        if [[ $(echo "$lines" | wc -l) -gt 1 ]]; then
-            echo; echo "$lines"
-        fi
-        rm -f "$TASKIT_STACKTRACE_FILE"
     fi
 } >&2
 
@@ -121,11 +127,19 @@ trap taskit_cleanup EXIT
 
 # To make TasKit pretty
 ESC=$'\e'
-C_RED="$ESC[31m"
-C_GREEN="$ESC[32m"
-C_CYAN="$ESC[36m"
-C_YELLOW="$ESC[33m"
-C_OFF="$ESC[39m"
+if [[ -t 1 ]]; then
+    C_RED="$ESC[31m"
+    C_GREEN="$ESC[32m"
+    C_CYAN="$ESC[36m"
+    C_YELLOW="$ESC[33m"
+    C_OFF="$ESC[39m"
+else
+    C_RED=
+    C_GREEN=
+    C_CYAN=
+    C_YELLOW=
+    C_OFF=
+fi
 
 declare -Ag TASKIT_LOG_LEVELS=(
     [DEBUG]=-1
@@ -145,6 +159,7 @@ TASKIT_TASKFILE=
 # by the value of this variable if set(in your Taskfile or as an environment
 # variable). Defaults to a 8-character random string.
 TASKIT_LINE_PREFIX=${TASKIT_LINE_PREFIX:-"$(openssl rand -hex 4)"}
+[[ $TASKIT_LINE_PREFIX =~ [A-Za-z0-9_]+ ]] || exit 1
 
 # These are used to track cli options
 TASKIT_SHOW_HELP=
@@ -154,9 +169,14 @@ TASKIT_SKIP_DEPS=
 # Temporary scrap var used internally, don't look.
 TASKIT__=
 
+# Serial id used internally for generating unique variable names.
+# It will be incremented after every use.
+TASKIT_SID__=0
+
 # A task is a function whose name is prefixed with 'Task::'.
 # This array holds all task function names in definition order.
 TASKS=()
+
 
 #
 # Holds attributes for every task
@@ -198,21 +218,21 @@ declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
         local value=${spec#*=}; has_default=1
         spec=${spec%%=*}=
     fi
-    [[ $spec =~ [_a-zA-Z][_a-zA-Z0-9]*[!%=]? ]] || {
-        TASKIT_ERRORS+=("Invalid parameter specification for $TASK: $1")
-        return 1
+    [[ $spec =~ ^[_a-zA-Z][_a-zA-Z0-9]*[!%=]?$ ]] || {
+        TASKIT_ERRORS+=("Invalid parameter specification for $TASK: $spec")
+        taskit_stack_trace log; return 1
     }
     local name=${spec%[\!%=]}
     [[ ! ${TASK_ATTRS[$TASK$FUNCNAME $name]:-} ]] || {
-        TASKIT_ERRORS+=("Duplicate parameter spec in $TASK: $name")
-        return 1
+        TASKIT_ERRORS+=("Duplicate parameter name in $TASK: $name")
+        taskit_stack_trace log; return 1
     }
     if [[ $spec == *% && "${TASK_ATTRS[$TASK$FUNCNAME]} " == *%* ]]; then
-        TASKIT_ERRORS+=("Multiple % parameters is not allowed!")
-        return 1
+        TASKIT_ERRORS+=("Multiple '%' parameters is not allowed!")
+        taskit_stack_trace log; return 1
     fi
     TASK_ATTRS[$TASK$FUNCNAME]+=" $spec"
-    TASK_ATTRS[$TASK$FUNCNAME $name]=$*
+    TASK_ATTRS[$TASK$FUNCNAME $name]=${*:-.}
     if [[ ${has_default:-} ]]; then
         TASK_ATTRS[$TASK$FUNCNAME $name default]=$value
     fi
@@ -222,7 +242,10 @@ declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
 # status. Set this to true tells taskit to continue with the next task regardless of
 # the task's exit status.
 @ignore_status () {
-    local val; taskit_parse_bool "${1:-yes}" val || return $?
+    local val; taskit_parse_bool "${1:-yes}" val || {
+        TASKIT_ERRORS+=("Invalid boolean value: $1")
+        taskit_stack_trace log; return 1
+    }
     TASK_ATTRS[$TASK$FUNCNAME]=$val
 }
 
@@ -231,12 +254,14 @@ declare -Ag TASK_ATTRS=()  # "task-func-name@attr-func-name" -> "value"
 # starting this task.
 #
 @needs () { # <task1> [name=value ...] [task2 ...]
-    (( $# )) || return 1
-
+    (( $# )) || {
+        TASKIT_ERRORS+=("Empty @needs is not allowed!")
+        taskit_stack_trace log; return 1
+    }
     # here we save the dependency specification first and process them all
     # later. This allows us to have multiple @needs declarations for a task.
     #
-    local name=task_needs_$RANDOM
+    local name=task_needs_$(( RANDOM + TASKIT_SID__++ ))
     declare -ag $name
     local -n items=$name; items=("$@")
 
@@ -251,7 +276,7 @@ _taskit_process_task@needs () {
     done
 
     local tasks=()
-    taskit_parse_args_of_tasks "${needs[@]}" || return $?
+    taskit_parse_args_of_tasks "${needs[@]}" || { taskit_stack_trace log; return; }
     # above adds "task_func_name task_args_array_name" to the tasks array.
 
     TASK_ATTRS[$task@needs]=${tasks[*]}
@@ -261,6 +286,44 @@ _taskit_process_task@needs () {
 #
 # @noargs_status - exit status of the no argument run of the task.
 # @status - a string of exit codes from each run of the task.
+
+
+TASKIT_REMOTE_TASKS=()
+@remote () {
+    TASK_ATTRS[$TASK$FUNCNAME]=1
+    TASKIT_REMOTE_TASKS+=($TASK)
+}
+
+# -----------------------------------------------------------------------------
+
+TASKIT_LOCAL_DIR=${TASKIT_LOCAL_DIR:-~/.taskit}
+[[ $TASKIT_LOCAL_DIR =~ [A-Za-z0-9._-]+ ]] || exit 1
+
+TASKIT_RUN_DIR=$TASKIT_LOCAL_DIR/$BASHPID
+
+TASKIT_REMOTE_DIR='~/.taskit'
+
+
+# The list of hostnames to ssh to when running remote tasks.
+HOSTS=()
+declare -Ag HOST_ATTRS=()  # ([hostname@attrbute_name]=attribute_value ...)
+if [[ ${TASKIT_SSH_OPTS:-} ]]; then
+    TASKIT_SSH_OPTS=($TASKIT_SSH_OPTS)
+else
+    TASKIT_SSH_OPTS=(
+      -o RequestTTY=no
+      -o PasswordAuthentication=no
+      -o ControlMaster=auto
+      -o ControlPersist=60s
+      -o ControlPath="$TASKIT_LOCAL_DIR"/ssh-%h-%p-%r
+    )
+fi
+if [[ ${TASKIT_SSH_CMD:-} ]]; then
+    TASKIT_SSH_CMD=($TASKIT_SSH_CMD)
+else
+    TASKIT_SSH_CMD=(ssh "${TASKIT_SSH_OPTS[@]}")
+fi
+
 # -----------------------------------------------------------------------------
 
 taskit_parse_bool () {
@@ -268,7 +331,7 @@ taskit_parse_bool () {
     case ${1,,} in
         y|yes|t|true|1) result_=1  ;;
         n|no|f|false|0) result_=   ;;
-        *)              return 1   ;;
+        *) taskit_stack_trace log; return 1 ;;
     esac
 }
 
@@ -280,8 +343,8 @@ taskit_init () {
         declare -F $tasks \
           |
         while read -r func lineno file; do
-            file=$(taskit_abspath "$file")
-            declare -n offset=${TASKIT_SRC_MAP[$file]}
+            file=$(taskit_abspath "$file") zero=(0)
+            declare -n offset=${TASKIT_SRC_MAP[$file]:-zero}
             echo $func $(( lineno + offset )) $file
         done \
           |
@@ -291,7 +354,7 @@ taskit_init () {
     # Parse the function definition for each task in order to evaluate
     # task attribute specifications.
     #
-    # We are not 100% strict but the parsing should work most cases.
+    # We are not 100% strict but the parsing should work in most cases.
     #
     local funcname line TASK
     for funcname in ${TASKS[*]}; do
@@ -299,32 +362,23 @@ taskit_init () {
             if [[ $line =~ ^Task:: ]]; then
                 TASK=${line%% *}; read       # read off the '{'
 
-                # we don't allow '=' in task function name as it can confused
-                # with named arguments passed to a task
+                # we don't allow '=' in task function name as it can be
+                # confused with named arguments passed to a task
                 if [[ $TASK == *=* ]]; then
                     TASKIT_ERRORS+=("Invalid task name: $TASK")
-                    return 1
+                    taskit_stack_trace log; return 1
                 fi
-
-                # enable RETURN trap in order to save the line
-                # number from which the last failed task returned.
-                declare -ft $TASK
-
             elif [[ $line =~ ^[[:space:]]*(\( )?:[[:space:]]+@ ]]; then
                 # NOTE: \( is for functions whose body is a subshell
                 deco=@${line#*@}
-                eval "$deco" || return $?
+                eval "$deco" || { taskit_stack_trace log; return; }
             else
                 break
             fi
         done < <(declare -f $funcname)
     done
 
-    taskit_post_init || return $?
-
-    # The following trap is written in a single line in this source file to avoid
-    # adding line counts to $LINENO.
-    trap 'TASKIT__=$BASH_COMMAND; if [[ $FUNCNAME == Task::* ]]; then TASKIT_RETLINE="$FUNCNAME $LINENO $TASKIT__"; fi' RETURN
+    taskit_post_init || { taskit_stack_trace log; return; }
 }
 
 taskit_post_init () {
@@ -332,7 +386,7 @@ taskit_post_init () {
     for task in ${TASKS[*]}; do
         _taskit_process_task@needs $task || {
             TASKIT_ERRORS+=("Failed processing dependencies for $task")
-            return 1
+            taskit_stack_trace log; return 1
         }
     done
 }
@@ -414,7 +468,7 @@ taskit_parse_args_of_tasks() {
         done
 
         # dynamically allocate an associative array for storing the arguments
-        local task_args_name=task_args_$RANDOM
+        local task_args_name=task_args_$(( RANDOM + TASKIT_SID__++ ))
         declare -gA "$task_args_name"
         tasks+=("$task $task_args_name")
 
@@ -450,7 +504,7 @@ taskit_parse_args_of_tasks() {
             param=${spec%[\!%=]}; sigil=${spec#$param}
 
             if [[ $sigil = % ]]; then
-                declare -Ag "${task_args[$param]:=${param}_$RANDOM}"
+                declare -Ag "${task_args[$param]:=${param}_$(( RANDOM + TASKIT_SID__++ ))}"
                 local i=0
                 for arg in "${unknown[@]}"; do
                     name=${arg%%=*} value=${arg#*=}
@@ -519,6 +573,7 @@ taskit_log () {  # [level] <message>
         level=${TASKIT_LOG_LEVELS[INFO]}
         label=INFO
     fi
+    # message's log level must be >= TASKIT_LOG_LEVEL otherwise we don't log it.
     (( level >= TASKIT_LOG_LEVEL )) || return 0
 
     local logf fd
@@ -538,7 +593,7 @@ taskit_log () {  # [level] <message>
     fi
 
     local ts; printf -v ts "%(%Y-%m-%dT%T%z)T"
-    printf "${color:-}$TASKIT_LINE_PREFIX %s|%s|user=%s|pid=$$|$label|%s${color:+"$C_OFF"}\n" \
+    printf "${color:-}$TASKIT_LINE_PREFIX %s|%s|user=%s|pid=$BASHPID|$label|%s${color:+"$C_OFF"}\n" \
            "$HOSTNAME" \
            "$ts" \
            "$USER" \
@@ -548,18 +603,20 @@ taskit_log () {  # [level] <message>
 
 taskit_run () { # [task1 [name1=value1 ...] task2 ...]
     local tasks=()
-    taskit_parse_args_of_tasks "$@" || return $?
+    taskit_parse_args_of_tasks "$@" || { taskit_stack_trace log; return; }
 
     local t rc task
     for t in "${tasks[@]}"; do
         task=${t%% *}
-        _taskit_run_task_with_args $task ${t#* }; rc=$?
+        if [[ ${TASK_ATTRS[$task@remote]:-} ]]; then
+            _taskit_run_remote_task_with_args $task ${t#* }; rc=$?
+        else
+            _taskit_run_task_with_args $task ${t#* }; rc=$?
+        fi
         __taskit_break_if_not_ignoring_failed
-        TASKIT_RETLINE=
     done
     return $rc
 }
-declare -ft taskit_run  # to support the RETURN trap.
 
 _taskit_run_task_with_args () {
     local task rc
@@ -570,7 +627,6 @@ _taskit_run_task_with_args () {
             task=${deps[i]}
             _taskit_run_task_with_args $task ${deps[i+1]}; rc=$?
             __taskit_break_if_not_ignoring_failed
-            TASKIT_RETLINE=
             unset 'deps[i]' 'deps[i+1]'; (( i += 2 ))
         done
 
@@ -604,7 +660,7 @@ _taskit_run_task_with_args () {
                      "$(IFS=$'\n'; echo $(local -p |grep ^_ | sed 's/^_//'))"
 
     if [[ ! ${TASKIT_DRY_RUN:-} ]]; then
-        $task; local rc=$?
+        $task; rc=$?
     else
         rc=0
     fi
@@ -630,29 +686,252 @@ _taskit_run_task_with_args () {
     return $rc
 
 }
-declare -ft _taskit_run_task_with_args  # to support the RETURN trap
+
+taskit_ssh_init () {
+    # Turn HOSTS into an array of "hostname:port".
+    local host i=0
+    for host in ${HOSTS[*]}; do
+        if [[ $host =~ [[:space:]] ]]; then
+            TASKIT_ERRORS+=("Invalid host: $host")
+            taskit_stack_trace log; return 1
+        fi
+        if [[ ! $host =~ :[0-9]+$ ]]; then
+            host=$host:22
+            HOSTS[i]=$host
+        fi
+        (( ++i ))
+    done
+    (( ${#TASKIT_REMOTE_TASKS[*]} )) || return 0
+
+    for host in ${HOSTS[*]}; do
+        taskit_ssh_connect $host || continue
+        if taskit_ssh_send "
+            set -m &&
+            export SHELL=\$BASH &&
+            export TASKIT_RUN_DIR=$TASKIT_REMOTE_DIR/$BASHPID &&
+            mkdir -p \"\$TASKIT_RUN_DIR\" &&
+            cat > \"\$TASKIT_RUN_DIR/taskit\" &&
+            source \"\$TASKIT_RUN_DIR/taskit\" &&
+            echo '$TASKIT_LINE_PREFIX' rc=\$?
+           " < "$BASH_SOURCE" \
+           && taskit_ssh_recv $host \
+           && taskit_ssh_parse_reply
+        then
+            HOST_ATTRS[$host@initialized]=1
+        fi
+    done
+}
+
+taskit_ssh_connected () {
+    local host=$1
+    local pid=${HOST_ATTRS[$host@ssh_pid]}
+    [[ $pid ]] && kill -n 0 $pid >/dev/null 2>&1
+}
+
+taskit_ssh_connect () {  # <hostname:port>
+    local host=$1
+    taskit_ssh_connected $host && return
+
+    local run_dir=$TASKIT_RUN_DIR/$host
+    mkdir -p "$run_dir" || { taskit_stack_trace log; return; }
+    local attempt=$(( $(
+            shopt -s nullglob
+            echo $run_dir/[0-9]* | tr ' ' '\n' | sort -nr | head -1
+        ) + 1
+    ))
+    run_dir=$run_dir/$attempt
+    mkdir "$run_dir" || { taskit_stack_trace log; return; }
+
+    local stdin=$run_dir/stdin   \
+          stdout=$run_dir/stdout \
+          stderr=$run_dir/stderr
+    mkfifo -m 0600 "$stdin" "$stdout" || { taskit_stack_trace log; return; }
+
+    "${TASKIT_SSH_CMD[@]}" -p ${host##*:} -- ${host%:*} \
+        "exec -l /usr/bin/env bash" <"$stdin" >"$stdout" 2>"$stderr" &
+    local ssh_pid=$! cmd_fd out_fd
+
+    exec {cmd_fd}>"$stdin" {out_fd}<"$stdout" || { taskit_stack_trace log; return; }
+
+    HOST_ATTRS[$host@ssh_pid]=$ssh_pid
+    HOST_ATTRS[$host@fds]="$cmd_fd $out_fd"
+    HOST_ATTRS[$host@cmd_pipe]=$stdin
+    HOST_ATTRS[$host@out_pipe]=$stdout
+    HOST_ATTRS[$host@err_file]=$stderr
+
+    local vars=vars_$(( RANDOM + TASKIT_SID__++ )); declare -gA $vars
+    HOST_ATTRS[$host@vars]=$vars
+
+    HOST_ATTRS[$host@initialized]=
+    HOST_ATTRS[$host@failed]=
+}
+
+timeout () { # <duration_spec> [-s sigspec] <command>
+    local timeout=$1 signal; shift
+    if [[ $1 == -s ]]; then
+        signal=$2; shift 2
+    else
+        signal=TERM
+    fi
+    local -; set -m; ("$@") & local pid=$!
+    (sleep $timeout && kill -s $signal -$pid >/dev/null 2>&1) &
+    wait $pid
+}
+
+taskit_ssh_send () { # <hostname:port> <cmd>
+    local host=$1; shift
+    local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]}
+    [[ -p $cmd_pipe ]] || { taskit_stack_trace log; return; }
+    timeout 1 printf "%s\n" "$@" > "$cmd_pipe"
+}
+
+taskit_ssh_recv () { # <hostname:port>
+    local host=$1 out_pipe=${HOST_ATTRS[$host@out_pipe]}
+    [[ -p $out_pipe ]] || { taskit_stack_trace log; return; }
+    read -t 1.5 -r TASKIT__ < "$out_pipe"
+}
+taskit_ssh_parse_reply () {
+    local prefix line rc
+    read -r prefix line rc <<<"$TASKIT__"
+    if [[ $prefix == "$TASKIT_LINE_PREFIX" ]]; then
+        eval "$line" || { taskit_stack_trace log; return; }
+    fi
+    return ${rc:-1}
+}
+
+taskit_ssh_run_job () { # <host> [cmd1 cmd2 ...]
+    local host=$1; shift
+    local cmd=: sep='&&' arg
+    for arg in "$@"; do
+        cmd+=" $sep $arg"
+    done
+
+    local dir=\$TASKIT_RUN_DIR id=$TASKIT_TASK_RUN_ID
+    local out=$dir/$id.out
+
+    taskit_ssh_send $host "
+        ($cmd) >$out & rc=\$?
+        echo; echo '$TASKIT_LINE_PREFIX' rc=\$rc pid=\$!
+    " || { taskit_stack_trace log; return; }
+
+    taskit_ssh_recv $host || { taskit_stack_trace log; return; }
+    taskit_ssh_parse_reply
+}
+
+_taskit_run_remote_task_with_args () {
+    (( ++TASKIT_TASK_RUN_ID ))
+    local task=$1 args=$2
+
+    local host rc out waiting=()
+
+    #FIXME:
+    #  - only run the task on successful hosts
+    #  - handle @ignore_status
+    #
+    for host in ${HOSTS[*]}; do
+        local vars=${HOST_ATTRS[$host@vars]}
+
+        if taskit_ssh_run_job $host "
+            $(declare -gp $vars); declare -n vars=$vars
+            $(declare -gp $args)
+            _taskit_run_task_with_args $task $args
+           "
+        then
+            taskit_ssh_send $host "
+                wait %%
+                out=\$TASKIT_RUN_DIR/$TASKIT_TASK_RUN_ID.out
+                declare -gA vars
+                echo $TASKIT_LINE_PREFIX \
+                     rc=\$? out=\$(base64 -w0 <\$out) \
+                     \$(declare -p $vars 2>/dev/null | sed 's/-A/-gA/')
+            "
+            waiting+=($host)
+        else
+            HOST_ATTRS[$host@failed]=$?
+        fi
+    done
+
+    while (( ${#waiting[*]} )); do
+        local i=0
+        for host in ${waiting[*]}; do
+            if taskit_ssh_recv $host; then
+                local rc=0 out
+                if taskit_ssh_parse_reply; then
+                    HOST_ATTRS[$host@out]=$(base64 -d <<<"$out")
+                else
+                    rc=$?
+                fi
+                HOST_ATTRS[$host@rc]=$rc
+                unset 'waiting[i]'
+            fi
+            (( ++i ))
+        done
+    done
+}
+
+
+taskit_ssh_disconnect () {  # <hostname:port>
+    local host=$1
+
+    local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]}
+    if [[ -p "$cmd_pipe" ]]; then
+        taskit_ssh_send $host "exit 0" || true
+    fi
+
+    local fd
+    for fd in ${HOST_ATTRS[$host@fds]}; do
+        eval exec "$fd>&-"
+    done
+    unset "HOST_ATTRS[$host@fds]"
+
+    local pid=${HOST_ATTRS[$host@ssh_pid]}
+    if [[ $pid ]] && kill $pid 2>/dev/null; then
+        HOST_ATTRS[$host@ssh_pid]=
+    fi
+
+    local -n vars=${HOST_ATTRS[$host@vars]}; unset -v vars
+    unset "HOST_ATTRS[$host@initialized]"
+    unset "HOST_ATTRS[$host@failed]"
+}
+
+taskit_ssh_clean_up () {
+    local host name file
+    for host in ${HOSTS[*]}; do
+        taskit_ssh_disconnect "$host"
+
+        for name in cmd_pipe out_pipe err_file; do
+            file=${HOST_ATTRS[$host@$name]}
+            if [[ -e $file ]]; then rm -f "$file"; fi
+            unset "HOST_ATTRS[$host@$name]"
+        done
+    done
+}
+
+
+
 
 taskit_show_usage () {
     echo "Usage: $(basename "$0") [options] [task1 [[arg1]=value1 ...] task2 ...]"
     echo "\
 options:
-  -h        Show this help.
-  -t        List all available tasks.
-  -D        Skip task dependencies.
-  -d        Dry run; show but don't really run any tasks.
-  -v LEVEL  Set the log verbosity level to LEVEL($(IFS=\|
+  -h [TASK]  Show this help or a task specific help if a task is specified.
+  -t         List all available tasks.
+  -D         Skip task dependencies.
+  -d         Dry run; show but don't really run any tasks.
+  -v LEVEL   Set the log verbosity level to LEVEL($(IFS=\|
                 echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
-            )).
+             )).
   -f FILE   Use FILE as the Taskfile.
+  -m HOSTS  A list of hostnames to run remote tasks on.
 "
 }
 
-taskit_die () { taskit_log FATAL "$@" >&2; exit 1; }
+taskit_die () { taskit_log FATAL "$1" >&2; exit ${2:-1}; }
 
 taskit_parse_cli () {
     local option
     OPTIND=1
-    while getopts ':htf:Dv:d-' option "$@"; do
+    while getopts ':htf:Dv:dm:-' option "$@"; do
         case $option in
             h) TASKIT_SHOW_HELP=1 ;;
             t) TASKIT_SHOW_TASKS=1 ;;
@@ -663,6 +942,7 @@ taskit_parse_cli () {
             v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
                ;;
             f) TASKIT_TASKFILE=$OPTARG ;;
+            m) local oIFS=$IFS; IFS=$IFS,; HOSTS=($OPTARG); IFS=$oIFS ;;
             -) break ;;
 
             :) taskit_die "Missing option argument for -$OPTARG" ;;
@@ -679,8 +959,7 @@ taskit_parse_cli () {
         if [[ -r ./Taskfile ]]; then
             TASKIT_TASKFILE=./Taskfile
         else
-            taskit_die "No Taskfile specified via -f" \
-                       "nor one found in the current directory!"
+            taskit_die "No Taskfile specified via -f nor one found in the current directory!"
         fi
     fi
     TASKIT__=("$@")
@@ -705,6 +984,8 @@ declare -A TASKIT_SRC_MAP  # source_file -> array_name
 #     that are sourced directly and indirectly from it.
 #
 #   - the rest of elements are absolute pathes sourced directly by source_file.
+#
+# NOTE: This doesn't work if source_file is not a normal file.
 
 # Because we have no control over when the source function is called and returns,
 # we need to track the source call stack ourselves. This allows us to update the
@@ -714,7 +995,8 @@ TASKIT_SRC_STACK=()
 
 taskit_abspath() {
     if [[ $1 != /* ]]; then
-        echo "$(cd "$PWD/${1%/*}" && pwd)/${1##*/}"
+        local p=$PWD/$1
+        echo "$(cd "${p%/*}" && pwd)/${1##*/}"
     else
         echo "$1"
     fi
@@ -722,7 +1004,7 @@ taskit_abspath() {
 
 
 taskit_srcmap_add_src_node () {
-    local array=source_$RANDOM; declare -ga $array
+    local array=source_$(( RANDOM + TASKIT_SID__++ )); declare -ga $array
     TASKIT_SRC_MAP[$1]=$array
 
     local offset=$2
@@ -764,19 +1046,25 @@ taskit_srcmap_dump () {
 
 source () {
     set -- "$(taskit_abspath "$1")" "${@:2}"
-    [[ ${TASKIT_SRC_MAP[$1]:-} ]] && return 0
-    taskit_srcmap_add_src_node "$1" $BASH_LINENO
-    command source "$@"
-    taskit_srcmap_update_src_node "$1"
+    if [[ -f $1 ]]; then
+        [[ ${TASKIT_SRC_MAP[$1]:-} ]] && return 0
+        taskit_srcmap_add_src_node "$1" $BASH_LINENO
+        command source "$@"
+        local rc=$?
+        taskit_srcmap_update_src_node "$1"
+        return $rc
+    else
+        command source "$@"
+    fi
 }
 
 taskit_main () {
     if (( ${#TASKIT_EXIT_CMDS[*]} )); then
-        local oIFS=$IFS NL=$'\n'; IFS=$NL
-        trap "set +e$NL${TASKIT_EXIT_CMDS[*]}" EXIT
+        local oIFS=$IFS IFS=$'\n'
+        trap "${TASKIT_EXIT_CMDS[*]}" EXIT
         IFS=$oIFS
     fi
-    taskit_init || taskit_die "Failed initializing TasKit!"
+    taskit_init || { taskit_stack_trace log; return; }
 
     if [[ ${TASKIT_SHOW_HELP:-} ]]; then
         taskit_show_task_help "$1"; exit 0
@@ -787,6 +1075,8 @@ taskit_main () {
     fi
 
     printf -v TASKIT_START_TIME "%(%s)T"
+
+    taskit_ssh_init || { taskit_stack_trace log; return; }
 
     # if no tasks specified in the command line
     if (( ! $# )); then
@@ -803,9 +1093,12 @@ taskit_main () {
 }
 
 
-taskit_parse_cli "$@"; set -- "${TASKIT__[@]}"
+if [[ $0 = "$BASH_SOURCE" ]]; then
+    taskit_parse_cli "$@"; set -- "${TASKIT__[@]}"
 
-source "$TASKIT_TASKFILE"
-[[ $? = 0 ]] || taskit_die "Failed sourcing Taskfile! $TASKIT_TASKFILE"
+    source "$TASKIT_TASKFILE"; TASKIT_RC=$?
+    [[ $TASKIT_RC = 0 ]] || taskit_die \
+            "Failed sourcing Taskfile! $TASKIT_TASKFILE" $TASKIT_RC
 
-taskit_main "$@"
+    taskit_main "$@"
+fi

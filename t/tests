@@ -1,0 +1,307 @@
+#!/usr/bin/env bait
+#
+
+NL=$'\n'
+export TASKIT_LINE_PREFIX=$RANDOM$RANDOM
+taskit() {
+    command taskit "$@" | grep -v "$TASKIT_LINE_PREFIX"
+    return $PIPESTATUS
+}
+
+Case "An empty Taskfile" {
+    taskit -f <(echo)
+}
+
+Case "A Taskfile returning non-zero when sourced by taskit fails" {
+    local output rc
+    output=$(
+        taskit -f <(cat <<'EOF'
+            echo hello
+            Task::a-task () { echo world; }
+            return 123
+EOF
+        ) a-task
+    ) || rc=$?
+    [[ $output = hello && $rc = 123 ]]
+}
+
+Case "Sources 'Taskfile' in the current directory if one is not specified explicitly" {
+    local d output
+    d=$(mktemp -d tmp.XXXXXXXXXXX) || return $?
+    output=$(
+        cd "$d" &&
+        echo "Task::a-task () { echo hello; }" > Taskfile &&
+        taskit a-task
+    )
+    rm -rf "$d"
+    [[ $output = hello ]]
+}
+
+Case "A simple task that succeeds" {
+    local output
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                echo "Hello Taskit!"
+            }
+EOF
+        ) a-task
+    )
+    [[ $output = "Hello Taskit!" ]]
+}
+
+Case "A simple task that fails" {
+    local rc
+    taskit -f <(echo 'Task::a-task () { return 123; }') a-task || rc=$?
+    [[ $rc = 123 ]]
+}
+
+Case "A task can also be refered to by its function name" {
+    local output
+    output=$(
+        taskit -f <(echo 'Task::a-task () { echo hello; }') Task::a-task
+    )
+    [[ $output = "hello" ]]
+}
+
+Case "Runs the 'default' task if one is defined and no tasks are specified to run" {
+     output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () { echo hello; }
+            Task::default () { echo the default; }
+EOF
+        )
+     )
+     [[ $output = "the default" ]]
+}
+
+Case "taskit -t shows all tasks with @desc and exits 0; not running any tasks" {
+    local output
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @desc "This is a task"
+                echo "It does something"
+            }
+            Task::internal () { echo a helper task; }
+            Task::another-task () {
+                : @desc "Another task"
+            }
+EOF
+        ) -t a-task
+    )
+    [[ $? = 0 && $output = "Available tasks:
+
+  a-task          -    This is a task
+  another-task    -    Another task"  ]]
+}
+
+
+Case "taskit -h <task> shows the task's help doc" {
+    local d output
+    d=$(mktemp -d tmp.XXXXXXXXXXX) || return $?
+    output=$(
+        cd "$d" && cat > Taskfile <<'EOF'
+            # Consecutive comments above the task definition will be used as task description.
+
+            # This is an example task.
+            # It is used as a test.
+            Task::a-task () {
+                : @desc "This task does something."
+                : @param optional "this parameter is optional"
+                : @param optional_with_default=123 "this optional parameter has a default."
+                : @param required! "This parameter is required"
+                : @param slurpy% "this parameter collects all unknown named arguments"
+            }
+EOF
+        taskit -h a-task
+    )
+    rm -rf "$d"
+    [[ $output = "TASK
+        a-task -- This task does something.
+
+DESCRIPTION
+        This is an example task.
+        It is used as a test.
+
+PARAMETERS
+        optional                     This parameter is optional.
+        optional_with_default=123    This optional parameter has a default.
+        required!                    This parameter is required.
+        slurpy%                      This parameter collects all unknown named arguments." ]] 
+}
+
+
+Case "A task with optional and required parameters" {
+    local tasks='
+        Task::seq () {
+            : @param start=1
+            : @param end!
+            : @param step
+
+            local i
+            for (( i=$_start; i<=$_end; i+=${_step:-1} )); do
+                echo $i
+            done
+        }
+    '
+    local output rc
+
+    output=$(taskit -f <(echo "$tasks") seq 2>&1); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Required parameter not set for Task::seq: end" <<<"$output"
+
+    output=$(taskit -f <(echo "$tasks") seq end=10); output=$(echo $output)
+    assert [[ $output = "1 2 3 4 5 6 7 8 9 10" ]]
+
+
+    output=$(taskit -f <(echo "$tasks") seq start=5 end=10); output=$(echo $output)
+    assert [[ $output = "5 6 7 8 9 10" ]]
+
+    output=$(taskit -f <(echo "$tasks") seq step=2 end=10); output=$(echo $output)
+    assert [[ $output = "1 3 5 7 9" ]]
+}
+
+Case "A task with a slurpy parameter" {
+    local output
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param threshold=5
+                : @param rest%
+
+                local k
+                for k in "${!_rest[@]}"; do
+                    if [[ ${_rest[$k]} -ge $_threshold ]]; then
+                        echo $k
+                    fi
+                done | sort
+            }
+EOF
+        ) a-task a=1 b=2 c=3 d=4 e=5 threshold=3
+    )
+    output=$(echo $output)
+    [[ $output = "c d e" ]]
+}
+
+Case "Tasks with incorrect parameter specifications" {
+    local output rc
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Invalid parameter specification for Task::a-task: " <<<"$output"
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param "bad name"
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Invalid parameter specification for Task::a-task: bad name" <<<"$output"
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param 123
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Invalid parameter specification for Task::a-task: 123" <<<"$output"
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param name
+                : @param name
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Duplicate parameter name in Task::a-task: name" <<<"$output"
+
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param name
+                : @param name=abc
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Duplicate parameter name in Task::a-task: name" <<<"$output"
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param name!
+                : @param name
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Duplicate parameter name in Task::a-task: name" <<<"$output"
+
+
+    output=$(
+        taskit -f <(cat <<'EOF'
+            Task::a-task () {
+                : @param all%
+                : @param rest%
+            }
+EOF
+        ) 2>&1
+    ); rc=$?
+    assert [[ $rc -ne 0 ]] && grep "Multiple '%' parameters is not allowed!" <<<"$output"
+}
+
+Case "A task run without arguments will only be run once" {
+    local output
+    output=$(taskit -f <(echo 'Task::a-task () { echo hello; }') a-task a-task)
+    [[ $output = hello ]]
+}
+
+Case "A task run with arguments will always run" {
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @param name=someone
+                echo hello $_name
+            }'
+        ) a-task a-task a-task name=taskit a-task
+    )
+    [[ $output = "hello someone${NL}hello taskit" ]]
+}
+
+Case "A task with dependencies" {
+    false
+}
+
+Case "A task cannot have missing dependency" {
+    false
+}
+
+Case "A Task cannot have circular dependency" {
+    false
+}
+
+Case "A dependent task with arguments" {
+    false
+}
+
+Case "A task's dependency cannot omit its required argument" {
+    false
+}
+
+Case "A failed task shows its stack trace" {
+    false
+}
+
