@@ -30,14 +30,13 @@
 #   - make log line configurable
 #   - allow task aliases. e.g., @aliases
 #   - allow tagging tasks for search, and filtered execution
-#   - tests
 #   - allow pre/post task hooks
 #   - think about task namespace support.
 #
-#   - allow remote task execution. e.g., with : @remote
+#   - allow remote task execution. e.g., with : @remote [host-pattern]
 #
 set -E
-BASH_COMPAT=4.3
+BASH_COMPAT=4.3  # currently needed for using 'break' outside of loop bodies.
 
 
 # Start time of the first task
@@ -292,6 +291,7 @@ _taskit_process_task@needs () {
 
 TASKIT_REMOTE_TASKS=()
 @remote () {
+    taskit_die "Remote tasks not working yet! Sorry!" #FIXME
     TASK_ATTRS[$TASK$FUNCNAME]=1
     TASKIT_REMOTE_TASKS+=($TASK)
 }
