@@ -9,7 +9,7 @@ taskit() {
 }
 
 Case "An empty Taskfile" {
-    taskit -f <(echo)
+    assert taskit -f <(echo)
 }
 
 Case "A Taskfile returning non-zero when sourced by taskit fails" {
@@ -22,7 +22,7 @@ Case "A Taskfile returning non-zero when sourced by taskit fails" {
 EOF
         ) a-task
     ) || rc=$?
-    [[ $output = hello && $rc = 123 ]]
+    assert [[ $output = hello && $rc = 123 ]]
 }
 
 Case "Sources 'Taskfile' in the current directory if one is not specified explicitly" {
@@ -34,7 +34,7 @@ Case "Sources 'Taskfile' in the current directory if one is not specified explic
         taskit a-task
     )
     rm -rf "$d"
-    [[ $output = hello ]]
+    assert [[ $output = hello ]]
 }
 
 Case "A simple task that succeeds" {
@@ -47,13 +47,13 @@ Case "A simple task that succeeds" {
 EOF
         ) a-task
     )
-    [[ $output = "Hello Taskit!" ]]
+    assert [[ $output = "Hello Taskit!" ]]
 }
 
 Case "A simple task that fails" {
     local rc
     taskit -f <(echo 'Task::a-task () { return 123; }') a-task || rc=$?
-    [[ $rc = 123 ]]
+    assert [[ $rc = 123 ]]
 }
 
 Case "A task can also be refered to by its function name" {
@@ -61,7 +61,7 @@ Case "A task can also be refered to by its function name" {
     output=$(
         taskit -f <(echo 'Task::a-task () { echo hello; }') Task::a-task
     )
-    [[ $output = "hello" ]]
+    assert [[ $output = "hello" ]]
 }
 
 Case "Runs the 'default' task if one is defined and no tasks are specified to run" {
@@ -72,7 +72,27 @@ Case "Runs the 'default' task if one is defined and no tasks are specified to ru
 EOF
         )
      )
-     [[ $output = "the default" ]]
+     assert [[ $output = "the default" ]]
+}
+
+Case "Sourcing task functions defined in other files works" {
+    local d output
+    d=$(mktemp -d tmp.XXXXXXXXXXX) || return $?
+    output=$(
+        cd "$d" &&
+        echo 'Task::in-file-a () { echo $BASH_SOURCE; }' > ./a &&
+        echo 'Task::in-file-b () { echo $BASH_SOURCE; }; source ./c' > ./b &&
+        echo 'Task::in-file-c () { echo $BASH_SOURCE; }' > ./c &&
+        echo '
+          source ./a
+          Task::a-task () { echo ${TASKS[*]}; }
+          source ./b
+          Task::another-task () { :; }
+        ' > ./Taskfile &&
+        taskit a-task
+    )
+    rm -rf "$d"
+    assert grep "Task::in-file-a Task::a-task Task::in-file-b Task::in-file-c Task::another-task" <<<"$output"
 }
 
 Case "taskit -t shows all tasks with @desc and exits 0; not running any tasks" {
@@ -90,10 +110,12 @@ Case "taskit -t shows all tasks with @desc and exits 0; not running any tasks" {
 EOF
         ) -t a-task
     )
-    [[ $? = 0 && $output = "Available tasks:
+    assert {
+        [[ $? = 0 && $output = "Available tasks:
 
   a-task          -    This is a task
   another-task    -    Another task"  ]]
+    }
 }
 
 
@@ -117,7 +139,8 @@ EOF
         taskit -h a-task
     )
     rm -rf "$d"
-    [[ $output = "TASK
+    assert {
+        [[ $output = "TASK
         a-task -- This task does something.
 
 DESCRIPTION
@@ -128,7 +151,8 @@ PARAMETERS
         optional                     This parameter is optional.
         optional_with_default=123    This optional parameter has a default.
         required!                    This parameter is required.
-        slurpy%                      This parameter collects all unknown named arguments." ]] 
+        slurpy%                      This parameter collects all unknown named arguments." ]]
+    }
 }
 
 
@@ -150,15 +174,24 @@ Case "A task with optional and required parameters" {
     output=$(taskit -f <(echo "$tasks") seq 2>&1); rc=$?
     assert [[ $rc -ne 0 ]] && grep "Required parameter not set for Task::seq: end" <<<"$output"
 
+    output=$(taskit -f <(echo "$tasks") seq begin=1 end=10 2>&1); output=$(echo $output)
+    assert grep "Unknown arguments for Task::seq: begin=1" <<<"$output"
+
+    output=$(taskit -f <(echo "$tasks") seq = end=10 start 2>&1); output=$(echo $output)
+    assert grep "Missing parameter name for Task::seq: =" <<<"$output"
+    assert grep "Task function not found: Task::start" <<<"$output"
+
     output=$(taskit -f <(echo "$tasks") seq end=10); output=$(echo $output)
     assert [[ $output = "1 2 3 4 5 6 7 8 9 10" ]]
-
 
     output=$(taskit -f <(echo "$tasks") seq start=5 end=10); output=$(echo $output)
     assert [[ $output = "5 6 7 8 9 10" ]]
 
     output=$(taskit -f <(echo "$tasks") seq step=2 end=10); output=$(echo $output)
     assert [[ $output = "1 3 5 7 9" ]]
+
+    output=$(taskit -f <(echo "$tasks") seq step=2 end=5 seq start=6 end=8); output=$(echo $output)
+    assert [[ $output = "1 3 5 6 7 8" ]]
 }
 
 Case "A task with a slurpy parameter" {
@@ -180,7 +213,7 @@ EOF
         ) a-task a=1 b=2 c=3 d=4 e=5 threshold=3
     )
     output=$(echo $output)
-    [[ $output = "c d e" ]]
+    assert [[ $output = "c d e" ]]
 }
 
 Case "Tasks with incorrect parameter specifications" {
@@ -265,7 +298,7 @@ EOF
 Case "A task run without arguments will only be run once" {
     local output
     output=$(taskit -f <(echo 'Task::a-task () { echo hello; }') a-task a-task)
-    [[ $output = hello ]]
+    assert [[ $output = hello ]]
 }
 
 Case "A task run with arguments will always run" {
@@ -278,30 +311,145 @@ Case "A task run with arguments will always run" {
             }'
         ) a-task a-task a-task name=taskit a-task
     )
-    [[ $output = "hello someone${NL}hello taskit" ]]
+    assert [[ $output = "hello someone${NL}hello taskit" ]]
 }
 
-Case "A task with dependencies" {
-    false
+Case "A task with dependencies and dependencies have arguments" {
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @needs task1 arg1=abc arg2=123 task2
+                : @needs task3 task6 a=1 b=2 arg1=gg
+                echo $FUNCNAME
+            }
+            Task::task1 () {
+                : @param arg1
+                : @param arg2
+                : @needs task4 arg1=kkk
+                : @needs task5
+                echo $FUNCNAME $_arg1 $_arg2
+            }
+            Task::task2 () {
+                : @needs task7 arg1=777
+                echo $FUNCNAME
+            }
+            Task::task3 () { echo $FUNCNAME; }
+            Task::task4 () {
+                : @param arg1
+                echo $FUNCNAME $_arg1
+            }
+            Task::task5 () { echo $FUNCNAME; }
+            Task::task6 () {
+                : @param arg1
+                : @param rest%
+                : @needs task3
+                echo $FUNCNAME $_arg1
+                local k
+                for k in "${!_rest[@]}"; do
+                    echo $k = ${_rest[$k]}
+                done | sort
+            }
+            Task::task7 () {
+                : @param arg1
+                echo $FUNCNAME $_arg1
+            }
+
+            '
+        ) a-task
+    )
+    assert {
+        [[ $output = "\
+Task::task4 kkk
+Task::task5
+Task::task1 abc 123
+Task::task7 777
+Task::task2
+Task::task3
+Task::task6 gg
+a = 1
+b = 2
+Task::a-task" \
+        ]]
+    }
 }
 
 Case "A task cannot have missing dependency" {
-    false
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @needs whatever
+                echo $FUNCNAME
+            }'
+        ) a-task 2>&1
+    )
+    assert grep "Task function not found: Task::whatever" <<<"$output"
+    assert grep "Failed processing dependencies for Task::a-task" <<<"$output"
 }
 
 Case "A Task cannot have circular dependency" {
-    false
-}
-
-Case "A dependent task with arguments" {
-    false
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @needs a-task
+            }
+            Task::task-x () {
+                : @needs task-y
+                : @needs task-z
+            }
+            Task::task-y () {
+                : @needs task-w
+                : @needs task-z
+            }
+            Task::task-z () {
+                : @needs task-w
+            }
+            Task::task-w () {
+                : @needs task-x
+            }
+            '
+        ) 2>&1
+    )
+    assert [[ $(grep "Circular task dependency" <<<"$output" | wc -l) = 14 ]]
 }
 
 Case "A task's dependency cannot omit its required argument" {
-    false
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @needs another-task
+                echo $FUNCNAME
+            }
+            Task::another-task () {
+                : @param arg!
+                echo another task
+            }'
+        ) a-task 2>&1
+    )
+    assert grep "Required parameter not set for Task::another-task: arg" <<<"$output"
+    assert grep "Failed processing dependencies for Task::a-task" <<<"$output"
 }
 
 Case "A failed task shows its stack trace" {
-    false
+    local output
+    output=$(
+        taskit -f <(echo '
+            set -e
+            Task::a-task () {
+                : @needs another-task arg=123
+                echo $FUNCNAME
+            }
+            Task::another-task () {  # line 7
+                : @param arg!
+                echo another task
+                (( 1 > 2 ))
+                echo not reaching here
+            }'
+        ) a-task 2>&1
+    )
+    assert egrep "File /dev/fd/[0-9]+, line 7, in Task::another-task \(\)" <<<"$output"
 }
 
