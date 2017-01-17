@@ -297,7 +297,13 @@ EOF
 
 Case "A task run without arguments will only be run once" {
     local output
-    output=$(taskit -f <(echo 'Task::a-task () { echo hello; }') a-task a-task)
+    output=$(taskit -f <(echo '
+        Task::a-task () {
+            : @param arg=123
+            echo hello
+        }'
+      ) a-task a-task
+    )
     assert [[ $output = hello ]]
 }
 
@@ -319,9 +325,10 @@ Case "A task with dependencies and dependencies have arguments" {
     output=$(
         taskit -f <(echo '
             Task::a-task () {
+                : @param arg1=aaa
                 : @needs task1 arg1=abc arg2=123 task2
                 : @needs task3 task6 a=1 b=2 arg1=gg
-                echo $FUNCNAME
+                echo $FUNCNAME $_arg1
             }
             Task::task1 () {
                 : @param arg1
@@ -356,7 +363,7 @@ Case "A task with dependencies and dependencies have arguments" {
             }
 
             '
-        ) a-task
+        ) a-task a-task arg1=xyz
     )
     assert {
         [[ $output = "\
@@ -369,7 +376,13 @@ Task::task3
 Task::task6 gg
 a = 1
 b = 2
-Task::a-task" \
+Task::a-task aaa
+Task::task4 kkk
+Task::task1 abc 123
+Task::task6 gg
+a = 1
+b = 2
+Task::a-task xyz" \
         ]]
     }
 }
@@ -385,7 +398,6 @@ Case "A task cannot have missing dependency" {
         ) a-task 2>&1
     )
     assert grep "Task function not found: Task::whatever" <<<"$output"
-    assert grep "Failed processing dependencies for Task::a-task" <<<"$output"
 }
 
 Case "A Task cannot have circular dependency" {
@@ -430,7 +442,6 @@ Case "A task's dependency cannot omit its required argument" {
         ) a-task 2>&1
     )
     assert grep "Required parameter not set for Task::another-task: arg" <<<"$output"
-    assert grep "Failed processing dependencies for Task::a-task" <<<"$output"
 }
 
 Case "A failed task shows its stack trace" {
@@ -451,5 +462,25 @@ Case "A failed task shows its stack trace" {
         ) a-task 2>&1
     )
     assert egrep "File /dev/fd/[0-9]+, line 7, in Task::another-task \(\)" <<<"$output"
+}
+
+Case "Exact stack trace without set -e" {
+    local output
+    output=$(
+        taskit -f <(echo '
+            Task::a-task () {
+                : @needs another-task arg=123
+                echo $FUNCNAME
+            }
+            Task::another-task () {
+                : @param arg!
+                echo another task
+                (( 1 > 2 )) || taskit_die  # line 9
+                echo not reaching here
+            }'
+        ) a-task 2>&1
+    )
+    assert egrep "Return status: 1" <<<"$output"
+    assert egrep "File /dev/fd/[0-9]+, line 9, in Task::another-task \(\)" <<<"$output"
 }
 
