@@ -150,6 +150,10 @@ TASKIT_LINE_PREFIX=${TASKIT_LINE_PREFIX:-"$(openssl rand -hex 4)"}
 TASKIT_SHOW_HELP=
 TASKIT_SHOW_TASKS=
 TASKIT_SKIP_DEPS=
+TASKIT_DRY_RUN=
+
+# List of space separated task name patterns. Matched tasks will be skipped.
+TASKIT_TASK_EXCLUDES=
 
 # Temporary scrap var used internally, don't look.
 TASKIT__=
@@ -642,6 +646,15 @@ _taskit_run_task_with_args () {
     local task=$1 rc
     local -n args_dict=$2
 
+    local pattern opts=$-; set -f
+    local patterns=(${TASKIT_TASK_EXCLUDES:-})
+    set +f; set -${opts//[is]}
+    for pattern in "${patterns[@]}"; do
+        if [[ $task == Task::${pattern#Task::} ]]; then
+            return 0
+        fi
+    done
+
     if [[ ${args_dict[no args]:-} && ${TASK_ATTRS[$task@noargs_status]:-} = 0 ]]; then
         taskit_log DEBUG "$task (noargs) had been completed successfully, skipping..."
         return 0
@@ -732,47 +745,50 @@ taskit_ssh_init () {
         HOST_ATTRS[$host@vars]=$vars
         HOST_ATTRS[$host@failed]=
     done
+
     (( ${#TASKIT_REMOTE_TASKS[*]} )) || return 0
+
+    local ssh_args=("${TASKIT_SSH_OPTS[@]}" -p ${host##*:} ${host%:*})
 
     for host in ${HOSTS[*]:-}; do
         HOST_ATTRS[$host@failed]=$FUNCNAME
-
         taskit_ssh_connect $host || {
             TASKIT_ERRORS+=("Failed connecting to $host")
             continue
         }
-        local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]:-}
-        if taskit_ssh_send $host "
+        local rc=0
+        taskit_ssh_send $host "
              set -m &&
              export SHELL=\$BASH &&
              export TASKIT_RUN_DIR=$TASKIT_REMOTE_DIR/$BASHPID &&
-             mkdir -p \"\$TASKIT_RUN_DIR\"       &&
-             cat > \"\$TASKIT_RUN_DIR/taskit\"   &&
-             cat > \"\$TASKIT_RUN_DIR/Taskfile\"
-
+             export TASKIT_LINE_PREFIX=$TASKIT_LINE_PREFIX &&
+             mkdir -p \"\$TASKIT_RUN_DIR\" &&
              echo '$TASKIT_LINE_PREFIX' rc=\$?
-           "
-        then
-            cat "$BASH_SOURCE" > "$cmd_pipe"
-            cat > "$cmd_pipe" <<'EOF'
-$(declare -fp ${TASKIT_REMOTE_TASKS[*]})
-EOF
-        else
+        " && 
+        taskit_ssh_recv $host &&
+        taskit_ssh_parse_reply || rc=$?
+        [[ $rc = 0 ]] || {
+            TASKIT_ERRORS+=("Failed initializing $host! rc=$rc")
             continue
-        fi
-
-        local rc
-        if taskit_ssh_recv $host &&
-           taskit_ssh_parse_reply
-        then
-            [[ $rc = 0 ]] || {
-                TASKIT_ERRORS+=("Failed initializing $host")
-                continue
-            }
-            HOST_ATTRS[$host@failed]=
-        else
+        }
+        ssh "${ssh_args[@]}" "cat > $TASKIT_REMOTE_DIR/$BASHPID/taskit" < "$BASH_SOURCE" &&
+        ssh "${ssh_args[@]}" "cat > $TASKIT_REMOTE_DIR/$BASHPID/Taskfile" <<<"$(
+            declare -fp ${TASKIT_REMOTE_TASKS[*]}
+        )" || {
+            TASKIT_ERRORS+=("Failed sending data to $host")
             continue
-        fi
+        }
+        taskit_ssh_send $host "
+            source \"$TASKIT_RUN_DIR/taskit\"
+            echo $TASKIT_LINE_PREFIX rc=\$?
+        " &&
+        taskit_ssh_recv $host &&
+        taskit_ssh_parse_reply || rc=$?
+        [[ $rc = 0 ]] || {
+            TASKIT_ERRORS+=("Failed initializing $host! rc=$rc")
+            continue
+        }
+        HOST_ATTRS[$host@failed]=
     done
 }
 
@@ -821,7 +837,7 @@ timeout () { # <duration_spec> [-s sigspec] <command>
     else
         signal=TERM
     fi
-    local opts=$-; set -m; ("$@") & local pid=$!; set -$opts
+    local opts=$-; set -m; ("$@") & local pid=$!; set +m; set -${opts//[is]}
     (sleep $timeout && kill -s $signal -$pid >/dev/null 2>&1) &
     wait $pid
 
@@ -831,17 +847,17 @@ taskit_ssh_send () { # <hostname:port> <cmd>
     local host=$1; shift
     local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]:-}
     [[ -p $cmd_pipe ]] || { taskit_stack_trace; return; }
-    timeout 1 printf "%s\n" "$@" > "$cmd_pipe"
+    timeout 3 printf "%s\n" "$@" > "$cmd_pipe"
 }
 
 taskit_ssh_recv () { # <hostname:port>
     local host=$1 out_pipe=${HOST_ATTRS[$host@out_pipe]:-}
     [[ -p $out_pipe ]] || { taskit_stack_trace; return; }
-    read -t 1.5 -r TASKIT__ < "$out_pipe"
+    read -t 3 -r TASKIT__ < "$out_pipe"
 }
 taskit_ssh_parse_reply () {
-    local prefix line rc
-    read -r prefix line rc <<<"$TASKIT__"
+    local prefix line
+    read -r prefix line <<<"$TASKIT__"
     if [[ $prefix == "$TASKIT_LINE_PREFIX" ]]; then
         eval "$line" || { taskit_stack_trace; return; }
     fi
@@ -872,7 +888,11 @@ _taskit_run_remote_task_with_args () {
 
             TASKIT_TASK_RUN_ID=$TASKIT_TASK_RUN_ID
             _taskit_run_task_with_args $task $args
-           " &&  #FIXME
+#FIXME:
+# taskit log outputs messes things up here
+#
+            echo $TASKIT_LINE_PREFIX rc=\$?
+           " &&
            taskit_ssh_recv $host &&
            taskit_ssh_parse_reply
         then
@@ -961,22 +981,23 @@ taskit_show_usage () {
     echo "Usage: $(basename "$0") [options] [task1 [[arg1]=value1 ...] task2 ...]"
     echo "\
 options:
-  -h [TASK]  Show this help or a task specific help if a task is specified.
-  -t         List all available tasks.
-  -D         Skip task dependencies.
-  -d         Dry run; show but don't really run any tasks.
-  -v LEVEL   Set the log verbosity level to LEVEL($(IFS=\|
-                echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
-             )).
-  -f FILE   Use FILE as the Taskfile.
-  -m HOSTS  A list of hostnames to run remote tasks on.
+  -h [TASK]    Show this help or a task specific help if a task is specified.
+  -t           List all available tasks.
+  -D           Skip task dependencies.
+  -d           Dry run; show but don't really run any tasks.
+  -x PATTERNS  Don't run any tasks matching the list of space-separated PATTERNS.
+  -v LEVEL     Set the log verbosity level to LEVEL($(IFS=\|
+                   echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
+               )).
+  -f FILE      Use FILE as the Taskfile.
+  -m HOSTS     A list of hostnames to run remote tasks on.
 "
 }
 
 taskit_parse_cli () {
     local option
     OPTIND=1
-    while getopts ':htf:Dv:dm:-' option "$@"; do
+    while getopts ':htf:Dv:dx:m:-' option "$@"; do
         case $option in
             h) TASKIT_SHOW_HELP=1 ;;
             t) TASKIT_SHOW_TASKS=1 ;;
@@ -984,6 +1005,7 @@ taskit_parse_cli () {
                taskit_log WARNING "Skipping task dependencies!"
                ;;
             d) TASKIT_DRY_RUN=1 ;;
+            x) TASKIT_TASK_EXCLUDES=$OPTARG ;;
             v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
                ;;
             f) TASKIT_TASKFILE=$OPTARG ;;
@@ -1041,9 +1063,17 @@ TASKIT_SRC_STACK=()
 taskit_abspath() {
     if [[ $1 != /* ]]; then
         local p=$PWD/$1
-        echo "$(cd "${p%/*}" && pwd)/${1##*/}"
+        p=$(cd "${p%/*}" && pwd) || taskit_die "Failed normalizing path: $p"
+        p=$p/${1##*/}
+        if [[ $p == */[./] ]]; then
+            p="${p%/?}"
+        elif [[ $p == */.. ]]; then
+            p=${p%/*/..}
+        fi
+        p=${p%/}
+        echo "${p:-/}"
     else
-        echo "$1"
+        echo "$1"  # NOTE: not normalizing in this case..., whatever.
     fi
 }
 

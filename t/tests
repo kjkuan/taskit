@@ -484,3 +484,22 @@ Case "Exact stack trace without set -e" {
     assert egrep "File /dev/fd/[0-9]+, line 9, in Task::another-task \(\)" <<<"$output"
 }
 
+Case "Task exclude should work" {
+    local output
+    output=$(
+        taskit -x 'a* yet-*' -f <(echo '
+            Task::a-task () { echo aaa; }
+            Task::another-task () { echo another; }
+            Task::yet-another-task () { echo yyyy; }
+            Task::b-task () {
+                : @needs a-task another-task
+                echo bbb
+            }
+            Task::c-task () {
+                : @needs b-task yet-another-task
+                echo ccc
+            }'
+        ) c-task
+    )
+    assert [[ $output = "bbb${NL}ccc" ]]
+}
