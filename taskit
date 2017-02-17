@@ -138,7 +138,8 @@ declare -Ag TASKIT_LOG_LEVELS=(
 TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[INFO]}
 
 # Path to Taskfile, either set via -f or ./Taskfile will be used
-TASKIT_TASKFILE=
+TASKFILE=
+TASKFILE_DIR=
 
 # Any lines printed by Taskit during task execution will be prefixed
 # by the value of this variable if set(in your Taskfile or as an environment
@@ -1031,7 +1032,7 @@ taskit_parse_cli () {
             x) TASKIT_TASK_EXCLUDES=$OPTARG ;;
             v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
                ;;
-            f) TASKIT_TASKFILE=$OPTARG ;;
+            f) TASKFILE=$OPTARG ;;
             m) local oIFS=$IFS; IFS=$IFS,; HOSTS=($OPTARG); IFS=$oIFS ;;
             -) break ;;
 
@@ -1045,13 +1046,15 @@ taskit_parse_cli () {
         taskit_show_usage; exit 0
     fi
 
-    if [[ ! $TASKIT_TASKFILE ]]; then
+    if [[ ! $TASKFILE ]]; then
         if [[ -r ./Taskfile ]]; then
-            TASKIT_TASKFILE=./Taskfile
+            TASKFILE=./Taskfile
         else
             taskit_die "No Taskfile specified via -f nor one found in the current directory!"
         fi
     fi
+    TASKFILE=$(taskit_abspath "$TASKFILE")
+    TASKFILE_DIR=$(dirname "$TASKFILE")
     TASKIT__=("$@")
 }
 
@@ -1194,9 +1197,9 @@ taskit_main () {
 if [[ $0 = "$BASH_SOURCE" ]]; then
     taskit_parse_cli "$@"; set -- "${TASKIT__[@]}"
 
-    source "$TASKIT_TASKFILE"; TASKIT_RC=$?
+    source "$TASKFILE"; TASKIT_RC=$?
     [[ $TASKIT_RC = 0 ]] || taskit_die \
-            "Failed sourcing Taskfile! $TASKIT_TASKFILE" $TASKIT_RC
+            "Failed sourcing Taskfile! $TASKFILE" $TASKIT_RC
 
     taskit_main "$@"
 fi
