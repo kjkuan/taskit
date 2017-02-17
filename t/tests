@@ -503,3 +503,36 @@ Case "Task exclude should work" {
     )
     assert [[ $output = "bbb${NL}ccc" ]]
 }
+
+Case "Task with @cwd should 'cd' in before and out after execution" {
+    local DIR=$(mktemp -p /tmp -d tmp.XXXXXXXXXXX) || return $?
+    export DIR
+    local output
+    output=$(
+        taskit -f <(echo '
+            HERE=$PWD
+            Task::a-task () {
+                : @cwd "$DIR"
+                [[ $PWD = "$DIR" ]]
+                echo "changed into the directory = $?"
+            }
+            Task::b-task () {
+                : @needs a-task
+                [[ $PWD = "$HERE" ]]
+                echo "back to where we were = $?"
+            }
+            Task::c-task () {
+                : @cwd /hopefully/this/directory/does/not/exist
+                echo "will not reach here"
+            }
+        ') b-task c-task
+    )
+    assert [[ $? -ne 0 ]]; rmdir "$DIR"
+    assert egrep "changed into the directory = 0" <<<"$output"
+    assert egrep "back to where we were = 0" <<<"$output"
+    assert ! egrep "will not reach here" <<<"$output"
+}
+
+
+
+

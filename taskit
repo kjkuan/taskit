@@ -66,7 +66,7 @@ taskit_stack_trace () {
     return $rc
 } >&2
 
-trap 'taskit_stack_trace $?; exit' ERR
+trap 'taskit_stack_trace $?' ERR
 
 taskit_die () {
     local rc=${2:-1}
@@ -265,6 +265,12 @@ _taskit_process_task@needs () {
     TASK_ATTRS[$task@needs]=${tasks[*]}
 }
 
+# Sets the working directory of the task
+@cwd () {
+    [[ ${1:-} ]] || taskit_die '@cwd requires a valid arg $1'
+    TASK_ATTRS[$TASK$FUNCNAME]=$1
+}
+
 
 # These are task attributes set by taskit for internal use.
 #
@@ -274,7 +280,7 @@ _taskit_process_task@needs () {
 
 TASKIT_REMOTE_TASKS=()
 @remote () {
-    taskit_die "Remote tasks not working yet! Sorry!" #FIXME
+#    taskit_die "Remote tasks not working yet! Sorry!" #FIXME
     TASK_ATTRS[$TASK$FUNCNAME]=1
     TASKIT_REMOTE_TASKS+=($TASK)
 }
@@ -288,6 +294,7 @@ TASKIT_RUN_DIR=${TASKIT_RUN_DIR:-"$TASKIT_LOCAL_DIR/$BASHPID"}
 [[ $TASKIT_RUN_DIR =~ ^[/A-Za-z0-9._-]+$ ]] || taskit_die
 
 TASKIT_REMOTE_DIR='~/.taskit'
+#NOTE: it must resolve to absolute path when evaluated.
 
 
 # The list of hostnames to ssh to when running remote tasks.
@@ -695,26 +702,42 @@ _taskit_run_task_with_args () {
     fi
 
     if [[ ! ${TASKIT_DRY_RUN:-} ]]; then
+        while :; do
+            local cwd=${TASK_ATTRS[$task@cwd]:-}
+            if [[ $cwd ]]; then
+                local old_cwd=$PWD
+                cd "$cwd" || {
+                    rc=$?; TASKIT_ERRORS+=("Failed cd into $cwd")
+                    break
+                }
+            fi
 
-        if [[ ${TASK_ATTRS[$task@remote]:-} ]]; then
-            # Here we are running on the remote host
+            if [[ ${TASK_ATTRS[$task@remote]:-} ]]; then
+                # Here we are running on the remote host
 
-            # run the remote task in a subshell in the background
-            (
-                trap "declare -p $vars > $TASKIT_RUN_DIR/$TASKIT_TASK_RUN_ID.vars" EXIT
-                # NOTE: $vars should be in the caller: _taskit_run_remote_task_with_args()
+                # run the remote task in a subshell in the background
+                (
+                    trap "declare -p $vars > $TASKIT_RUN_DIR/$TASKIT_TASK_RUN_ID.vars" EXIT
+                    # NOTE: $vars should be in the caller: _taskit_run_remote_task_with_args()
 
-                $task >$TASKIT_RUN_DIR/$TASKIT_TASK_RUN_ID.out
+                    $task >$TASKIT_RUN_DIR/$TASKIT_TASK_RUN_ID.out
 
-            ) & rc=$?
+                ) & rc=$?
 
-            echo; echo $TASKIT_LINE_PREFIX rc=$rc pid=$!
-            #
-            # NOTE: The exit status here only indicates the successful launch
-            #       of the task. Its exist status will be known when it's
-            #       wait'ed later.
-        else
-            $task; rc=$?
+                echo; echo $TASKIT_LINE_PREFIX rc=$rc pid=$!
+                #
+                # NOTE: The exit status here only indicates the successful launch
+                #       of the task. Its exist status will be known when it's
+                #       wait'ed later.
+            else
+                $task; rc=$?
+            fi
+            break
+        done
+        if [[ $cwd ]]; then
+            cd "$old_cwd" || {
+                rc=$?; TASKIT_ERRORS+=("Failed returning to cwd=$(dirs -l +0)")
+            }
         fi
     else
         rc=0
