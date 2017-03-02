@@ -98,8 +98,7 @@ taskit_cleanup () {
     # combine and show errors from Taskit if there's any.
     if (( ${#TASKIT_ERRORS[*]} )); then
         local oIFS=$IFS; IFS=$'\n'
-        echo
-        echo "${TASKIT_ERRORS[*]}" >&2
+        { echo; echo "${TASKIT_ERRORS[*]}"; } >&2
         IFS=$oIFS
     fi
 } >&2
@@ -141,6 +140,9 @@ TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[INFO]}
 # Path to Taskfile, either set via -f or ./Taskfile will be used
 export TASKFILE=
 export TASKFILE_DIR=
+
+# This will be non-null if taskit is running on a remote host
+export TASKIT_REMOTE=${TASKIT_REMOTE:-}
 
 # Any lines printed by Taskit during task execution will be prefixed
 # by the value of this variable if set(in your Taskfile or as an environment
@@ -282,6 +284,45 @@ _taskit_process_task@needs () {
 
 # -----------------------------------------------------------------------------
 
+TASKIT_REMOTE_TASKS=()
+@remote () {
+    TASK_ATTRS[$TASK$FUNCNAME]=1
+    TASKIT_REMOTE_TASKS+=($TASK)
+}
+
+# -----------------------------------------------------------------------------
+
+export TASKIT_LOCAL_DIR=${TASKIT_LOCAL_DIR:-"$HOME/.taskit"}
+[[ $TASKIT_LOCAL_DIR =~ ^[/A-Za-z0-9._-]+$ ]] || taskit_die
+
+export TASKIT_RUN_DIR=${TASKIT_RUN_DIR:-"$TASKIT_LOCAL_DIR/$BASHPID"}
+[[ $TASKIT_RUN_DIR =~ ^[/A-Za-z0-9._-]+$ ]] || taskit_die
+
+export TASKIT_REMOTE_DIR='~/.taskit'
+#NOTE: it must resolve to absolute path when evaluated.
+
+
+# The list of hostnames to ssh to when running remote tasks.
+HOSTS=()
+declare -Ag HOST_ATTRS=()  # ([hostname@attrbute_name]=attribute_value ...)
+if [[ ${TASKIT_SSH_OPTS:-} ]]; then
+    TASKIT_SSH_OPTS=($TASKIT_SSH_OPTS)
+else
+    TASKIT_SSH_OPTS=(
+      -o RequestTTY=no
+      -o PasswordAuthentication=no
+      -o ControlMaster=auto
+      -o ControlPersist=60s
+      -o ControlPath="$TASKIT_LOCAL_DIR"/ssh-%h-%p-%r
+    )
+fi
+if [[ ${TASKIT_SSH_CMD:-} ]]; then
+    TASKIT_SSH_CMD=($TASKIT_SSH_CMD)
+else
+    TASKIT_SSH_CMD=(ssh "${TASKIT_SSH_OPTS[@]}")
+fi
+
+# -----------------------------------------------------------------------------
 
 taskit_parse_bool () {
     local -n result_=${2:?required}
@@ -572,10 +613,17 @@ taskit_log () {  # [level] <message>
     (( level >= TASKIT_LOG_LEVEL )) || return 0
 
     local logf fd
-    case $label in
-      INFO) logf=/dev/stdout; fd=1 ;;
-         *) logf=/dev/stderr; fd=2 ;;
-    esac
+
+    # if running on a remote host then all log output goes to stderr so that
+    # it doesn't mix with taskit_stline.
+    if [[ $TASKIT_REMOTE ]]; then
+        logf=/dev/stderr; fd=2
+    else
+        case $label in
+          INFO) logf=/dev/stdout; fd=1 ;;
+             *) logf=/dev/stderr; fd=2 ;;
+        esac
+    fi
 
     local color
     if [[ -t $fd ]]; then
@@ -672,7 +720,28 @@ _taskit_run_task_with_args () {
                     break
                 }
             fi
-            $task; rc=$?
+
+            if [[ ${TASK_ATTRS[$task@remote]:-} ]]; then
+                # Here we are running on the remote host
+
+                # run the remote task in a subshell in the background
+                (
+                    trap 'declare -p ${HOST_ATTRS[$TASKIT_HOST@vars]} \
+                            > "$TASKIT_RUN_DIR"'/$TASKIT_TASK_RUN_ID.vars EXIT
+
+                    declare -n HOST_VARS=${HOST_ATTRS[$TASKIT_HOST@vars]}
+                    HOST_VARS[stdout]=$($task)
+
+                ) & rc=$?
+
+                taskit_stline rc=$rc pid=$!
+                #
+                # NOTE: The exit status here only indicates the successful launch
+                #       of the task. Its exist status will be known when it's
+                #       wait'ed later.
+            else
+                $task; rc=$?
+            fi
             break
         done
         if [[ $cwd ]]; then
@@ -692,6 +761,269 @@ _taskit_run_task_with_args () {
     return $rc
 }
 
+taskit_ssh_init () {
+    # Turn HOSTS into an array of "hostname:port".
+    local host i=0 vars
+    for host in ${HOSTS[*]:-}; do
+        [[ $host =~ [[:space:]] ]] && taskit_die "Invalid host: $host"
+        if [[ ! $host =~ :[0-9]+$ ]]; then
+            host=$host:22
+            HOSTS[i]=$host
+        fi
+        (( ++i ))
+        vars=vars_$(( RANDOM + TASKIT_SID__++ )); declare -gA $vars
+        HOST_ATTRS[$host@vars]=$vars
+        HOST_ATTRS[$host@failed]=
+    done
+
+    (( ${#TASKIT_REMOTE_TASKS[*]} )) || return 0
+
+    local rc=0
+    Do () {
+        local host=$1
+        HOST_ATTRS[$host@failed]=$FUNCNAME
+        taskit_ssh_connect $host
+    }
+    Then () {
+      Do () {
+        local host=$1
+        taskit_ssh_send $host \
+            'export SHELL=$BASH' \
+            "export TASKIT_HOST=$host TASKIT_REMOTE=1" \
+            "export TASKIT_RUN_DIR=$TASKIT_REMOTE_DIR/$BASHPID" \
+            "export TASKIT_LINE_PREFIX=$TASKIT_LINE_PREFIX" \
+            'taskit_stline () { echo; echo ${TASKIT_LINE_PREFIX}_stline "$@"; }' \
+            'set -m && mkdir -p "$TASKIT_RUN_DIR"' \
+            'taskit_stline rc=$?' \
+        || { rc=$?; TASKIT_ERRORS+=("Failed connecting to $host"); return $rc; }
+      }
+      Then () {
+        Do () { taskit_ssh_recv_reply $1 || { rc=$?; return $rc; }; }
+        Then () {
+          Parallel-Do () {
+            local host=$1
+            local ssh_args=("${TASKIT_SSH_OPTS[@]}" -p ${host##*:} ${host%:*})
+            ssh "${ssh_args[@]}" 'cat > "$TASKIT_RUN_DIR"/taskit' < "$BASH_SOURCE" &&
+            ssh "${ssh_args[@]}" 'cat > "$TASKIT_RUN_DIR"/Taskfile' <<<"$(
+                declare -fp ${TASKIT_REMOTE_TASKS[*]}
+            )" 
+          }
+          Else-Do () { TASKIT_ERRORS+=("Failed sending data to $1"); }
+          Then () {
+            Do () {
+              local host=$1
+              taskit_ssh_send $host '
+                  source "$TASKIT_RUN_DIR/taskit" && taskit_init
+                  taskit_stline rc=$?
+              ' || {
+                rc=$?; TASKIT_ERRORS+=("Failed initializing $host! rc=$rc")
+                return $rc
+              }
+            }
+            Then-Do () {
+                local host=$1; taskit_ssh_recv_reply $host ||
+                    TASKIT_ERRORS+=("Failed initializing $host! rc=$?")
+            }
+          }
+        }
+      }
+    }; For-All ${HOSTS[*]:-}
+}
+
+taskit_ssh_connected () {
+    local host=$1
+    local pid=${HOST_ATTRS[$host@ssh_pid]:-}
+    [[ $pid ]] && kill -n 0 $pid >/dev/null 2>&1
+}
+
+taskit_ssh_connect () {  # <hostname:port>
+    local host=$1
+    taskit_ssh_connected $host && return
+
+    local run_dir=$TASKIT_RUN_DIR/$host
+    mkdir -p "$run_dir" || taskit_die
+    local attempt=$(( $(
+            shopt -s nullglob
+            echo $run_dir/[0-9]* | tr ' ' '\n' | sort -nr | head -1
+        ) + 1
+    ))
+    run_dir=$run_dir/$attempt
+    mkdir "$run_dir" || taskit_die
+
+    local stdin=$run_dir/stdin   \
+          stdout=$run_dir/stdout \
+          stderr=$run_dir/stderr
+    mkfifo -m 0600 "$stdin" "$stdout" || taskit_die
+
+    "${TASKIT_SSH_CMD[@]}" -p ${host##*:} -- ${host%:*} \
+        "exec -l /usr/bin/env bash" <"$stdin" >"$stdout" 2>"$stderr" &
+    local ssh_pid=$! cmd_fd out_fd
+
+    exec {cmd_fd}>"$stdin" {out_fd}<"$stdout" || taskit_die
+
+    HOST_ATTRS[$host@ssh_pid]=$ssh_pid
+    HOST_ATTRS[$host@fds]="$cmd_fd $out_fd"
+    HOST_ATTRS[$host@cmd_pipe]=$stdin
+    HOST_ATTRS[$host@out_pipe]=$stdout
+    HOST_ATTRS[$host@err_file]=$stderr
+}
+
+timeout () { # <duration_spec> [-s sigspec] <command>
+    local timeout=${1:?required} signal; shift
+    if [[ $1 == -s ]]; then
+        signal=$2; shift 2
+    else
+        signal=TERM
+    fi
+    local opts=$-; set -m; ("$@") & local pid=$!; set +m; set -${opts//[is]}
+    (sleep $timeout && kill -s $signal -$pid >/dev/null 2>&1) &
+    wait $pid
+
+}
+
+taskit_ssh_send () { # <hostname:port> [cmd1 cmd2 ...]
+    local host=${1:?required}; shift
+    local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]:-}
+    [[ -p $cmd_pipe ]] || { taskit_stack_trace; return; }
+    timeout 3 printf "%s\n" "$@" > "$cmd_pipe"
+}
+taskit_ssh_send_to_all_hosts () { # hosts_var failed_hosts_var [cmd1 cmd2 ...]
+    local host i=0
+    local -n hosts=${1:-required} failed=${2:-required}
+    for host in ${hosts[*]:-}; do
+        taskit_ssh_send $host "$@" || {
+            unset 'hosts[i]'
+            failed+=($host)
+        }
+        (( ++i ))
+    done
+}
+
+taskit_ssh_recv () { # <hostname:port> [timeout]
+    local host=${1:?required} out_pipe=${HOST_ATTRS[$host@out_pipe]:-}
+    [[ -p $out_pipe ]] || { taskit_stack_trace; return; }
+    read -t ${2:-1} -r < "$out_pipe"
+}
+taskit_ssh_recv_reply () { # <hostname:port> [timeout]
+    if taskit_ssh_recv "$@"; then
+        local prefix line
+        read -r prefix line <<<"$REPLY"
+        if [[ $prefix == "${TASKIT_LINE_PREFIX}_stline" ]]; then
+            eval "$line" || { taskit_stack_trace; return; }
+        fi
+    fi
+}
+
+rename_func () { # <old_name> <new_name> [append]
+    local f
+    f=$(declare -f ${1:?required}) || return $?
+    f=${f/$1/${2:?required}}
+    if [[ ${3:-} ]]; then
+        f="${f:0:${#f}-1}    $3; }"
+    fi
+    eval "$f" && unset -f $1
+}
+
+
+_taskit_run_remote_task_with_args () {
+    (( ++TASKIT_TASK_RUN_ID ))
+    local task=$1 args=$2
+
+    local host rc out waiting=()
+
+    #FIXME:
+    #  - only run the task on successful hosts
+    #  - handle @ignore_status
+    #
+    local vars pid
+    for host in ${HOSTS[*]:-}; do
+        if [[ ${HOST_ATTRS[$host@failed]} ]]; then
+            continue  #FIXME
+        fi
+
+        vars=${HOST_ATTRS[$host@vars]}  # name of the host vars array
+
+        if taskit_ssh_send $host "
+            TASKIT_TASK_RUN_ID=$TASKIT_TASK_RUN_ID
+            HOST_ATTRS[$host@vars]=$vars
+            $(declare -p $vars) &&
+            $(declare -p $args) &&
+            _taskit_run_task_with_args $task $args
+            taskit_stline rc=\$?
+           " &&
+             taskit_ssh_recv_reply $host
+        then
+            [[ $rc = 0 ]] &&
+            taskit_ssh_send $host \
+                'wait %% ; rc=$?' \
+                'source "$TASKIT_RUN_DIR"'/$TASKIT_TASK_RUN_ID.vars \
+                'taskit_stline rc=$rc "$(
+                    declare -p ${HOST_ATTRS[$TASKIT_HOST@vars]} 2>/dev/null | sed s/-A/-gA/
+                 )"
+                ' ||
+            {
+                TASKIT_ERRORS+=("Failed waiting for $task")
+                HOST_ATTRS[$host@failed]=$task
+                continue
+            }
+            waiting+=($host)
+        else
+            TASKIT_ERRORS+=("Failed launching remote $task")
+            HOST_ATTRS[$host@failed]=$task
+        fi
+    done
+
+    while (( ${#waiting[*]} )); do
+        local i=0 rc=0
+        for host in ${waiting[*]}; do
+            taskit_ssh_recv_reply $host || {
+                TASKIT_ERRORS+=("Failed parsing task wait result")
+                HOST_ATTRS[$host@failed]=$task
+            }
+            HOST_ATTRS[$host@rc]=$rc
+            unset 'waiting[i]'
+            (( ++i ))
+        done
+    done
+}
+
+
+taskit_ssh_disconnect () {  # <hostname:port>
+    local host=$1
+
+    local cmd_pipe=${HOST_ATTRS[$host@cmd_pipe]:-}
+    if [[ -p "$cmd_pipe" ]]; then
+        taskit_ssh_send $host "exit 0" || true
+    fi
+
+    local fd
+    for fd in ${HOST_ATTRS[$host@fds]:-}; do
+        eval exec "$fd>&-"
+    done
+    unset "HOST_ATTRS[$host@fds]"
+
+    local pid=${HOST_ATTRS[$host@ssh_pid]:-}
+    if [[ $pid ]] && kill $pid 2>/dev/null; then
+        HOST_ATTRS[$host@ssh_pid]=
+    fi
+
+    local -n vars=${HOST_ATTRS[$host@vars]}; unset -v vars
+    unset "HOST_ATTRS[$host@failed]"
+}
+
+taskit_ssh_clean_up () {
+    local host name file
+    for host in ${HOSTS[*]:-}; do
+        taskit_ssh_disconnect "$host"
+
+        for name in cmd_pipe out_pipe err_file; do
+            file=${HOST_ATTRS[$host@$name]:-}
+            if [[ -e $file ]]; then rm -f "$file"; fi
+            unset "HOST_ATTRS[$host@$name]"
+        done
+    done
+}
+
 
 taskit_show_usage () {
     echo "Usage: $(basename "$0") [options] [task1 [name1=value1 ...] task2 ...]"
@@ -704,8 +1036,9 @@ options:
   -x PATTERNS  Don't run any tasks matching the list of space-separated PATTERNS.
   -v LEVEL     Set the log verbosity level to LEVEL($(IFS=\|
                    echo "${!TASKIT_LOG_LEVELS[*]}" | tr A-Z a-z
-               )).
+               )). Or use -vv to increase the verbosity.
   -f FILE      Use FILE as the Taskfile.
+  -m HOSTS     A list of hostnames to run remote tasks on.
 "
 }
 
@@ -721,9 +1054,14 @@ taskit_parse_cli () {
                ;;
             d) TASKIT_DRY_RUN=1 ;;
             x) TASKIT_TASK_EXCLUDES=$OPTARG ;;
-            v) TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
+            v) if [[ $OPTARG =~ ^v+$ ]]; then 
+                   TASKIT_LOG_LEVEL=$(( TASKIT_LOG_LEVELS[INFO] - ${#OPTARG} ))
+               else
+                   TASKIT_LOG_LEVEL=${TASKIT_LOG_LEVELS[${OPTARG^^}]:?"Invalid log level: $OPTARG"}
+               fi
                ;;
             f) TASKFILE=$OPTARG ;;
+            m) local oIFS=$IFS; IFS=$IFS,; HOSTS=($OPTARG); IFS=$oIFS ;;
             -) break ;;
 
             :) taskit_die "Missing option argument for -$OPTARG" ;;
