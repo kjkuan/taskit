@@ -1,5 +1,11 @@
 #!/usr/bin/env bait
 #
+# You need https://github.com/kjkuan/bait to run the tests here.
+# Once both bait and taskit are in PATH, from the repo root, you can run
+# this file with:
+#
+#     prove -e bait t/tests
+#
 
 NL=$'\n'
 export TASKIT_LINE_PREFIX=$RANDOM$RANDOM
@@ -532,7 +538,3 @@ Case "Task with @cwd should 'cd' in before and out after execution" {
     assert egrep "back to where we were = 0" <<<"$output"
     assert ! egrep "will not reach here" <<<"$output"
 }
-
-
-
-
