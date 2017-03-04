@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # A Taskfile is just a bash script that will be sourced and run by taskit.
 
 # Taskit should work with set -e and/or set -u.
