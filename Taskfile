@@ -25,7 +25,14 @@ Task::mytask () {
     : @needs count-from-one  to=3           # dependency with arguments will ALWAYS be run.
     : @needs count-from-one count-from-one  # dependency without arguments only runs ONCE.
 
-    # Notice that the parameters are referenced with a '_' prefix..
+    # a non-zero exit status of a task function stops taskit from
+    # running the remaining tasks. This is the default.
+    : @ignore_status no
+
+    # switch the working directory of a task; the default is no cd.
+    : @cwd /tmp
+
+    # In the code below, notice that the parameters are referenced with a '_' prefix.
     # Also, that the slurpy(%) parameter(rest) collects unknown arguments in an array. 
 
     echo "${_greeting:-Hello}, $_name"
