@@ -70,7 +70,9 @@ trap 'taskit_stack_trace $?' ERR
 
 taskit_die () {
     local rc=${2:-1}
-    taskit_log FATAL "$1"
+    if [[ ${1:-} ]]; then
+        taskit_log FATAL "$1"
+    fi
     taskit_stack_trace "$rc" 1 || true
     exit $rc
 } >&2
@@ -495,9 +497,10 @@ taskit_parse_args_of_tasks() {
             param=${spec%[\!%=]}; sigil=${spec#$param}
 
             if [[ $sigil = % ]]; then
-                declare -Ag "${task_args[$param]:=${param}_$(( RANDOM + TASKIT_SID__++ ))}"
+                declare -Ag "${task_args[$param]:=${param}_$(( RANDOM + TASKIT_SID__++ ))}=()"
                 local i=0
-                for arg in "${unknown[@]}"; do
+                for arg in "${unknown[@]:-}"; do
+                    [[ $arg ]] || continue
                     name=${arg%%=*} value=${arg#*=}
                     printf -v "${task_args[$param]}[$name]" "%s" "$value"
                     unset 'unknown[i++]'
@@ -537,7 +540,7 @@ __taskit_free_args_of_tasks () {
         task=${t%% *}; local -n args_dict=${t#* }
 
         local spec param sigil
-        for spec in ${TASK_ATTRS[$task@param]}; do
+        for spec in ${TASK_ATTRS[$task@param]:-}; do
             param=${spec%[\!%=]}; sigil=${spec#$param}
             if [[ $sigil = '%' ]]; then
                 unset "args_dict[$param]"
@@ -614,7 +617,8 @@ _taskit_run_task_with_args () {
     local pattern opts=$-; set -f
     local patterns=(${TASKIT_TASK_EXCLUDES:-})
     set +f; set -${opts//[is]}
-    for pattern in "${patterns[@]}"; do
+    for pattern in "${patterns[@]:-}"; do
+        [[ $pattern ]] || continue
         if [[ $task == Task::${pattern#Task::} ]]; then
             return 0
         fi
@@ -648,7 +652,7 @@ _taskit_run_task_with_args () {
         if [[ $sigil = '%' ]]; then
             local -n "_$param=${args_dict[$param]}"
         else
-            local "_$param=${args_dict[$param]}"
+            local "_$param=${args_dict[$param]:-}"
         fi
     done
 
@@ -689,7 +693,7 @@ _taskit_run_task_with_args () {
 
 
 taskit_show_usage () {
-    echo "Usage: $(basename "$0") [options] [task1 [[arg1]=value1 ...] task2 ...]"
+    echo "Usage: $(basename "$0") [options] [task1 [name1=value1 ...] task2 ...]"
     echo "\
 options:
   -h [TASK]    Show this help or a task specific help if a task is specified.

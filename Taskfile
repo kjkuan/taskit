@@ -1,0 +1,49 @@
+# A Taskfile is just a bash script that will be sourced and run by taskit.
+
+# Taskit should work with set -e and/or set -u.
+# (probably not with set -o pipefail though, not tested)
+set -eu
+
+# A task is a function with a `Task::` prefix in its name.
+#
+Task::hello () { echo hello world; }
+
+# Comments right before the task will be parsed as the task's help doc.
+# 
+Task::mytask () {
+    # Null commands that begin with '@attr ...' at the beginning of a task body
+    # declare attributes for the task:
+
+    : @desc            "A simple task"
+
+    # You can declare parameters for a task so that it can be run with arguments.
+    : @param name!     "your name"
+    : @param greeting  "words to greet with"
+    : @param rest%     "rest of named arguments collected in an array"
+    : @needs count-from-one  to=3           # dependency with arguments will ALWAYS be run.
+    : @needs count-from-one count-from-one  # dependency without arguments only runs ONCE.
+
+    # Notice that the parameters are referenced with a '_' prefix..
+    # Also, that the slurpy(%) parameter(rest) collects unknown arguments in an array. 
+
+    echo "${_greeting:-Hello}, $_name"
+    if (( ${#_rest[*]} )); then
+        echo "The rest of named arguments are:"
+        local key
+        for key in "${!_rest[@]}"; do
+            echo "$key=${_rest[$key]}"
+        done
+    fi
+}
+
+# This task has no @desc so it won't be shown in `task -t`.
+# But it's still available to other tasks and from CLI.
+#
+Task::count-from-one () {
+    : @param to=5  "The number to count up to. (inclusive)"
+
+    local i
+    for (( i=1; i <= _to; i++ )); do
+        echo $i
+    done
+}
