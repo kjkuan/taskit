@@ -498,14 +498,14 @@ taskit_parse_args_of_tasks() {
 
             if [[ $sigil = % ]]; then
                 declare -Ag "${task_args[$param]:=${param}_$(( RANDOM + TASKIT_SID__++ ))}=()"
-                local i=0
-                for arg in "${unknown[@]:-}"; do
-                    [[ $arg ]] || continue
-                    name=${arg%%=*} value=${arg#*=}
-                    printf -v "${task_args[$param]}[$name]" "%s" "$value"
-                    unset 'unknown[i++]'
-                done
-
+                if (( ${#unknown[*]} )); then
+                    local i=0
+                    for arg in "${unknown[@]}"; do
+                        name=${arg%%=*} value=${arg#*=}
+                        printf -v "${task_args[$param]}[$name]" "%s" "$value"
+                        unset 'unknown[i++]'
+                    done
+                fi
             else
                 # if the parameter in the spec has no corresponding argument
                 if [[ " ${!task_args[*]} " != *" $param "* ]]; then
@@ -617,12 +617,13 @@ _taskit_run_task_with_args () {
     local pattern opts=$-; set -f
     local patterns=(${TASKIT_TASK_EXCLUDES:-})
     set +f; set -${opts//[is]}
-    for pattern in "${patterns[@]:-}"; do
-        [[ $pattern ]] || continue
-        if [[ $task == Task::${pattern#Task::} ]]; then
-            return 0
-        fi
-    done
+    if (( ${#patterns[*]} )); then
+        for pattern in "${patterns[@]}"; do
+            if [[ $task == Task::${pattern#Task::} ]]; then
+                return 0
+            fi
+        done
+    fi
 
     if [[ ${args_dict[no args]:-} && ${TASK_ATTRS[$task@noargs_status]:-} = 0 ]]; then
         taskit_log DEBUG "$task (noargs) had been completed successfully, skipping..."
