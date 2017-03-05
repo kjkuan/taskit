@@ -9,7 +9,7 @@ and running tasks defined in Bash.
 > **NOTE**:
     Taskit shares many ideas described in this well explained [blog post],
     and takes a step further with its implementation to provide a better
-    experience out of box. 
+    experience out of box.
 
 [blog post]: https://hackernoon.com/introducing-the-taskfile-5ddfe7ed83bd#.ni9rl6fjt
 
@@ -20,7 +20,7 @@ we can:
 ### See what options are available:
 
     $ taskit -h
-    Usage: taskit [options] [task1 [[arg1]=value1 ...] task2 ...]
+    Usage: taskit [options] [task1 [name1=value1 ...] task2 ...]
     options:
       -h [TASK]    Show this help or a task specific help if a task is specified.
       -t           List all available tasks.
@@ -36,6 +36,10 @@ we can:
     Available tasks:
 
       mytask    -    A simple task
+
+> **Note**:
+    Taskit will list the tasks in the order they are defined in the Taskfile.
+    This also takes into account tasks sourced from other files.
 
 ### See more detailed doc on a task:
 
@@ -78,10 +82,15 @@ we can:
 
 ## Roadmap
 Taskit is still a work in progress; things might change or get added, bugs are inevitable.
-In particular, I'm not sure about:
+In particular, some areas still need to be improved:
 
   - current log/output format
+    - the current format is not ideal, if you have any suggestions on how to best
+      present task execution info/logs, please let me know.
     - we should also think about how to display info for remote tasks
+
+  - properly document the public interface(i.e., global vars and functions, e.g., `taskit_run`)
+    made available by taskit for use in a Taskfile.
 
 Planned features:
   - remote tasks via ssh (WIP)
