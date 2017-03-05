@@ -35,7 +35,8 @@ we can:
     $ taskit -t
     Available tasks:
 
-      mytask    -    A simple task
+      mytask            -    A simple task
+      count-from-one    -    Prints whole numbers, one per line, from 1 up to 'to', inclusive.
 
 > **Note**:
     Taskit will list the tasks in the order they are defined in the Taskfile.
@@ -74,6 +75,8 @@ we can:
     5
     71421115 SABERTOOTH|2017-03-04T15:20:25-0500|user=jkuan|pid=4150|INFO|Task::mytask -- A simple task
     Hello, Jack
+    I'm in /tmp
+
     The rest of named arguments are:
     a=1
     b=2

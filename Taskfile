@@ -3,15 +3,16 @@
 # A Taskfile is just a bash script that will be sourced and run by taskit.
 #
 # You can also divide your Taskfile into multiple scripts and source them
-# here. Taskit stores the names of the tasks in a TASKS array, in their
-# definition order.
+# here.
+#
+# NOTE: Taskit stores the names of the tasks in a TASKS array, in their
+#       definition order.
 
 # Taskit should work with set -e and/or set -u.
 # (probably not with set -o pipefail though, not tested)
 set -eu
 
 # A task is a function with a `Task::` prefix in its name.
-#
 Task::hello () { echo hello world; }
 
 # Comments right before the task will be parsed as the task's help doc.
@@ -21,6 +22,7 @@ Task::mytask () {
     # declare attributes for the task:
 
     : @desc            "A simple task"
+    # Only tasks with @desc will be shown in `taskit -t`.
 
     # You can declare parameters for a task so that it can be run with arguments.
     : @param name!     "your name"
@@ -40,6 +42,8 @@ Task::mytask () {
     # Also, that the slurpy(%) parameter(rest) collects unknown arguments in an array. 
 
     echo "${_greeting:-Hello}, $_name"
+    echo "I'm in $PWD"
+    echo
     if (( ${#_rest[*]} )); then
         echo "The rest of named arguments are:"
         local key
@@ -49,11 +53,9 @@ Task::mytask () {
     fi
 }
 
-# This task has no @desc so it won't be shown in `task -t`.
-# But it's still available to other tasks and from CLI.
-#
 Task::count-from-one () {
-    : @param to=5  "The number to count up to. (inclusive)"
+    : @desc "Prints whole numbers, one per line, from 1 up to 'to', inclusive."
+    : @param to=5  "The number to count up to. (must be an interger >=1)"
 
     local i
     for (( i=1; i <= _to; i++ )); do
