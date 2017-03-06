@@ -1,7 +1,7 @@
 # Taskit
 Taskit is a task runner written in Bash that is similar, in spirit, to other
 tools such as *rake*, *fabric*, or *gulp*.  It lets you define tasks as
-functions, with declared parameters and other attributes, in a `Taskfile, and
+functions, with declared parameters and other attributes, in a `Taskfile`, and
 run them.  Task dependencies can be declared, and it dumps a stack trace on
 execution errors. The goal is to provide a uniform interface for discovering
 and running tasks defined in Bash.
