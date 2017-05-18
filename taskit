@@ -328,6 +328,21 @@ taskit_parse_bool () {
     esac
 }
 
+# Split a line into individual words, one per line, using bash's quoting rules.
+# The resulting lines are meant to be eval'ed
+#
+taskit_split_argline () {
+    local salt=$RANDOM$RANDOM$RANDOM$RANDOM
+    PATH= "$BASH" -rc '
+        set -ef; eval set -- "$1"
+        POSIXLY_CORRECT=1; \unset -f printf
+        \printf "'$salt\ '%q\n" "$@"
+    ' -- "$*" \
+    | grep "^$salt " \
+    | cut -d' ' -f2-
+}
+
+
 
 taskit_init () {
     TASKS=($(
@@ -1090,39 +1105,20 @@ taskit_main () {
 }
 
 
-taskit_run_remote_task () {
-    :
+taskit_server_run_task () {
+:
+
 }
 
 taskit_server_main () {
     local -A remote_funcs=(
-        [taskit_run_remote_task]=1
+        [taskit_server_run_task]=1
     )
     set -m
-    local taskcmd func task named_args 
-    while read -r taskcmd; do
-        func=${taskcmd%% *}
-        named_args=${taskcmd#* }
-
-        declare -F $task && [[ ${remote_funcs[$task]:-} ]] || continue  #FIXME: error
-
-        if [[ $task == Task::taskit_run_task ]]; then
-            remote_task=${named_args#*[^ ]}
-            remote_task=${remote_task%% *}
-            named_args=${named_args#*"$remote_task"}
-        else
-            remote_task=
-        fi
-        named_args=$(PATH= $BASH -rc "set -ef
-            declare -- $named_args"'
-            for var in $named_args; do
-                var=${var%%=*}
-                [[ $var != "$1" ]] || continue
-                printf "%s=%q\n" "$var" "${!var}"
-            done
-        ' -- "$remote_task")
-
-        $task $named_args
+    local cmd func task args 
+    while read -r func args; do
+        declare -F "$func" && [[ ${remote_funcs[$func]:-} ]] || continue  #FIXME: error
+        eval $func $(taskit_split_argline "$args")
     done
 }
 
