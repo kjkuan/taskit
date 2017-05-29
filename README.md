@@ -13,6 +13,20 @@ and running tasks defined in Bash.
 
 [blog post]: https://hackernoon.com/introducing-the-taskfile-5ddfe7ed83bd#.ni9rl6fjt
 
+# Installation
+Taskit depends on Bash >= 4.3 and GNU Coreutils to function correctly; otherwise
+it's just a single script, so you only need to copy it to your `PATH` and `chmod`
+it. E.g.:
+
+    curl https://raw.githubusercontent.com/kjkuan/taskit/1.0.0/taskit > /usr/local/bin/taskit
+    chmod +x /usr/local/bin/taskit
+    
+There's also a Homebrew Tap for it, so if you use Homebrew, you can track and
+install it on OS X with:
+
+    brew tap kjkuan/taskit
+    brew install taskit
+
 # Taskfile
 With the example [Taskfile](./Taskfile), running `taskit` from the same directory,
 we can:
