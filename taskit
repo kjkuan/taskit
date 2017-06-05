@@ -452,8 +452,8 @@ taskit_show_tasks () {
     for task in ${TASKS[*]:-}; do
         description=${TASK_ATTRS[$task@desc]:-}
         [[ $description ]] || continue
-        printf "  %s \t - \t %s\n" ${task#Task::} "$description"
-    done | column -ts$'\t'
+        printf "%s \t - \t %s\n" ${task#Task::} "$description"
+    done | column -ts$'\t' | sed 's/^/  /'
     echo
 }
 
@@ -499,8 +499,9 @@ taskit_show_task_help () {
 
         param_desc=${TASK_ATTRS[$task@param $param]:-}
         param_desc=${param_desc^}
-        echo -e "$indent$C_ON$spec$C_OFF \t\t ${param_desc%.}."
-    done | column -ts$'\t'
+        echo -e "$spec\t\t${param_desc%.}."
+
+    done | column -ts$'\t' | sed -r "s/^([^ ]+)/\t$C_ON\1$C_OFF/"
 }
 
 taskit_parse_args_of_tasks() {
@@ -668,6 +669,7 @@ taskit_run () { # [task1 [name1=value1 ...] task2 ...]
     taskit_parse_args_of_tasks "$@" || taskit_die
     (( ${#tasks[*]} )) || return 0
 
+#FIXME: should do a topological sort of the tasks, and then run them in order
     local t rc task
     for t in "${tasks[@]}"; do
         task=${t%% *}
@@ -739,6 +741,11 @@ _taskit_run_task_with_args () {
                     break
                 }
             fi
+#FIXME: if it's a remote task then we need to run it asynchronously with
+#       '&' in a subshell, and we need to do I/O redirects:
+#
+#    < /dev/null >"$TASKIT_REMOTE_DIR/stdout" 2>"$TASKIT_REMOTE_DIR/stderr"
+#
             $task; rc=$?
             break
         done
@@ -797,6 +804,8 @@ taskit_ssh_init () {
         taskit_ssh_connect "$host" || HOST_ATTRS[$host@failed]=1
     done
 
+
+#FIXME: need to send over TASK_ATTRS for remote tasks
     for host in ${HOSTS[*]:-}; do
         [[ ${HOST_ATTRS[$host@failed]} ]] && continue
         taskit_remote_cmd $host "
@@ -1151,7 +1160,7 @@ taskit_server_response () {
 }
 
 taskit_server_run_task () {
-    taskit_run "$1" "${@:2}"  >"$TASKIT_REMOTE_DIR/stdout" 2>"$TASKIT_REMOTE_DIR/stderr" &
+    taskit_run "$1" "${@:2}"
 }
 
 
@@ -1170,7 +1179,7 @@ taskit_server_ping () { printf "pong\n"; }
 
 
 taskit_server_main () {
-    TASKIT_EXIT_CMDS+=(taskit_server_response)
+#    TASKIT_EXIT_CMDS+=(taskit_server_response)
     taskit_init || taskit_die
 
     TASKIT_REMOTE_DIR=$(taskit_abspath "$TASKIT_REMOTE_DIR")

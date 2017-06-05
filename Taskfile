@@ -63,7 +63,7 @@ Task::count-from-one () {
     done
 }
 
-Task::copy-over-some-files () {
-    : @desc "Copy some files from local file system to remote servers"
-    : @needs copy src=~/.bashrc dest=\~/.bashrc
-}
+#Task::copy-over-some-files () {
+#    : @desc "Copy some files from local file system to remote servers"
+#    : @needs copy src=~/.bashrc dest=\~/.bashrc
+#}
